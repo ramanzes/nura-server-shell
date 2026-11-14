@@ -31,16 +31,16 @@
 | POWER коротко | включить погасший экран |
 | POWER 5 секунд | перезагрузка |
 
-Удалённо, по SSH:
+Удалённо, по SSH (systemd и OpenRC):
 ```sh
-sudo systemctl kill --kill-whom=main -s USR1 nura-keys   # = VOL+ и VOL- (htop)
-sudo systemctl kill --kill-whom=main -s USR2 nura-keys   # = VOL- дважды (консоль)
-sudo systemctl kill --kill-whom=main -s HUP  nura-keys   # = VOL+ дважды (меню)
+sudo nura-ctl top       # = VOL+ и VOL- вместе (табло <-> htop)
+sudo nura-ctl console   # = VOL- дважды (консоль; в htop — экранная клавиатура)
+sudo nura-ctl menu      # = VOL+ дважды (меню)
 ```
 
 ## Установка
 
-На телефоне с Nura / postmarketOS (systemd), по SSH:
+На телефоне с Nura / postmarketOS (systemd или OpenRC), по SSH:
 ```sh
 wget -qO- https://raw.githubusercontent.com/ramanzes/nura-server-shell/main/install.sh | sudo sh
 ```
@@ -52,6 +52,7 @@ wget -qO- https://raw.githubusercontent.com/ramanzes/nura-server-shell/main/inst
 ```sh
 git clone https://github.com/ramanzes/nura-server-shell.git && cd nura-server-shell && sudo ./install.sh
 ```
+Если работает графический интерфейс, установщик без `--headless` только раскладывает файлы и **не запускает** оболочку — она мешала бы графике (кнопки, экран).
 Установщик ставит пакеты (`python3 iw htop buffyboard kbd font-terminus networkmanager-cli` — все из репозиториев Alpine), копирует скрипты и службы, освобождает tty2–tty5 и запускает оболочку. Старая версия со скриптами `bacon-*` удаляется автоматически.
 
 **Обновление** — та же команда установки. **Удаление**: `sudo ./uninstall.sh` (с `--restore-gui` — вернуть графику).
@@ -64,9 +65,12 @@ git clone https://github.com/ramanzes/nura-server-shell.git && cd nura-server-sh
 |---|---|---|
 | OnePlus One | `oneplus-bacon` (armv7) | светодиод — три канала (SN3193), иногда не отвечает при загрузке: оболочка переподключает драйвер сама |
 | Google Nexus 5 | `lg-hammerhead` (armv7) | многоцветный светодиод `rgb:status`; ядро в раздел boot — см. ниже |
+| Xiaomi Redmi Note 7 | `xiaomi-lavender` (aarch64, **OpenRC**) | экран 1080×2340, VOL− на `pm8941_resin`, тачскрин Novatek, подсветка 0–4095, белый светодиод (состояние — частотой вспышек); **альбомная ориентация работает** |
 
-Требования: экран через `msm` DRM / fbdev **1080×1920** (разметка меню рассчитана на это разрешение), кнопки `gpio-keys`, тачскрин Synaptics (RMI4), подсветка `/sys/class/backlight/lcd-backlight`, NetworkManager.
-Батарея и светодиод определяются автоматически.
+Требования: Nura / postmarketOS с **systemd или OpenRC**, экран через fbdev (`/dev/fb0`), кнопки громкости, мультитач-тачскрин, NetworkManager.
+Железо определяется автоматически: размер экрана (`/sys/class/graphics/fb0/modes`), подсветка (первая в `/sys/class/backlight`, яркость в процентах от максимума), кнопки громкости (все устройства с `KEY_VOLUMEUP/DOWN` — они могут быть на разных), тачскрин (устройство с `ABS_MT_POSITION_X`), светодиод (`rgb:status`, `red/green/blue:status` или `white:status`), батарея и зарядка.
+
+На OpenRC установщик ставит службы в `/etc/init.d`, убирает `getty` с tty1–tty5 в `/etc/inittab` (вход остаётся на tty6) и настраивает кнопку питания для elogind.
 
 Для Nexus 5 без lk2nd полезно включить запись нового ядра в раздел boot при обновлении (иначе после `apk upgrade` пропадёт Wi-Fi):
 ```sh
@@ -80,7 +84,7 @@ echo 'deviceinfo_flash_kernel_on_update="true"' | sudo tee /etc/deviceinfo && su
 ### Ориентация htop и консоли
 
 Пункт меню «Ориентация htop/консоли» переключает портретную и альбомную (120 колонок) ориентацию для htop и консоли; настройка сохраняется в `/var/lib/nura-server-shell/rotate`. Экранная клавиатура поворачивается вместе с текстом. Табло и меню остаются портретными.
-Поворот требует опции ядра `CONFIG_FRAMEBUFFER_CONSOLE_ROTATION=y`. В ядре msm8974 (OnePlus One, Nexus 5) она выключена — пункт сообщит об этом; в ядре sdm660 (Xiaomi Redmi Note 7) включена.
+Поворот требует опции ядра `CONFIG_FRAMEBUFFER_CONSOLE_ROTATION=y`. В ядре msm8974 (OnePlus One, Nexus 5) она выключена — пункт сообщит об этом; в ядре sdm660 (Xiaomi Redmi Note 7) включена: там htop в альбомной ориентации — 146 колонок, касания строки F1…F10 и клавиатура поворачиваются вместе с текстом.
 
 ## Состав
 
@@ -88,7 +92,9 @@ echo 'deviceinfo_flash_kernel_on_update="true"' | sudo tee /etc/deviceinfo && su
 bin/nura-status        табло на tty1 и светодиод (sh)
 bin/nura-keys          кнопки, тачскрин, htop, консоль, меню, Wi-Fi (python3)
 bin/nura-wifi-join     ввод пароля и подключение к новой сети (sh, tty5)
-systemd/*.service      службы
+bin/nura-ctl           удалённое управление: top | console | menu
+systemd/*.service      службы systemd
+openrc/*               службы OpenRC (supervise-daemon)
 config/htoprc          колонки htop под экран телефона
 config/50-nura-powerkey.conf   logind: POWER коротко — ничего, 5 с — перезагрузка
 install.sh, uninstall.sh

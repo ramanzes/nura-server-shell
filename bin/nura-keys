@@ -148,9 +148,12 @@ def _caps(event, kind):
             words = f.read().split()
     except OSError:
         return 0
+    # Слова — старшие первыми, размером с long ядра: 64 бита на aarch64,
+    # 32 бита на armv7 (bacon, Nexus 5). Разрядность python = разрядность ядра.
+    bits = struct.calcsize("l") * 8
     mask = 0
-    for w in words:                       # старшие слова — первыми, по 64 бита
-        mask = (mask << 64) | int(w, 16)
+    for w in words:
+        mask = (mask << bits) | int(w, 16)
     return mask
 
 
