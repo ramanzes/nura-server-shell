@@ -1,0 +1,17 @@
+[Unit]
+Description=Text status screen on tty1 (instead of Phosh)
+After=systemd-user-sessions.service NetworkManager.service docker.service
+Conflicts=getty@tty1.service
+Before=getty@tty1.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nura-status
+Restart=always
+RestartSec=5
+StandardInput=null
+StandardOutput=null
+TTYPath=/dev/tty1
+
+[Install]
+WantedBy=multi-user.target

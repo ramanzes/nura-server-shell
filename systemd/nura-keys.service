@@ -1,0 +1,12 @@
+[Unit]
+Description=Volume keys: brightness, htop screen toggle (VOL+ and VOL- together)
+After=systemd-backlight@backlight:lcd-backlight.service nura-status.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nura-keys
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

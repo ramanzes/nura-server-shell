@@ -1,0 +1,915 @@
+#!/usr/bin/python3 -I
+"""nura-keys: кнопки громкости и тачскрин OnePlus One и Nexus 5 (Nura, без Phosh).
+
+Режимы:
+    табло   (tty1, nura-status)       VOL+/VOL-  яркость
+    htop    (tty2)                     VOL+/VOL-  прокрутка
+    консоль (tty3, login + buffyboard) VOL+/VOL-  яркость
+    меню    (tty4)                     VOL+/VOL-  выбор пункта, касание — выполнить
+    Wi-Fi   (tty5, пароль + buffyboard) ввод пароля новой сети (из меню)
+
+Переключение:
+    VOL+ и VOL- вместе   табло <-> htop       (из консоли/меню — на табло)
+    VOL- дважды          -> консоль           (из консоли — на табло)
+    VOL+ дважды          -> меню действий     (из меню — на табло)
+    удержание VOL+/VOL-  непрерывное действие
+
+Удалённо: sudo systemctl kill --kill-whom=main -s USR1 nura-keys   (= VOL+ и VOL-)
+          sudo systemctl kill --kill-whom=main -s USR2 nura-keys   (= VOL- дважды)
+          sudo systemctl kill --kill-whom=main -s HUP  nura-keys   (= VOL+ дважды)
+
+htop, консоль и меню работают только в своём режиме. Выход из консоли
+завершает сессию входа. Меню закрывается через IDLE_MENU секунд без
+действий — раньше, чем гаснет экран, чтобы касание тёмного экрана
+ничего не запустило.
+"""
+import errno
+import fcntl
+import glob
+import json
+import os
+import pty
+import select
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+BL = "/sys/class/backlight/lcd-backlight"
+LEVELS = [2, 4, 8, 14, 22, 34, 50, 70, 95, 125, 160, 205, 255]
+KEY_VOLUMEDOWN, KEY_VOLUMEUP, BTN_TOUCH = 114, 115, 330
+UP, DOWN = KEY_VOLUMEUP, KEY_VOLUMEDOWN
+EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
+ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x35, 0x36
+EV_FMT = "llHHi"
+EV_SIZE = struct.calcsize(EV_FMT)
+
+COMBO_WINDOW = 0.15    # с: кнопка без «двойного» значения — ожидание второй кнопки (комбо)
+HOLD_TIME = 0.30       # с: кнопка с «двойным» значением — дольше этого считается удержанием
+DOUBLE_WINDOW = 0.30   # с: пауза между щелчками двойного нажатия
+REPEAT_DELAY = 0.45    # с: от нажатия до начала автоповтора
+REPEAT_BRIGHT = 0.25   # с: шаг автоповтора яркости
+REPEAT_SCROLL = 0.07   # с: шаг автоповтора прокрутки htop
+REPEAT_MENU = 0.30     # с: шаг автоповтора в меню
+SCROLL_LINES = 3
+IDLE_TOP = 300         # с: htop без нажатий -> табло
+IDLE_CONSOLE = 600     # с: консоль без ввода -> logout и табло
+IDLE_MENU = 45         # с: меню без действий -> табло (экран гаснет через 60 с)
+IDLE_WIFI = 300        # с: ввод пароля Wi-Fi без действий -> табло
+TAP_MAX_MOVE = 120     # px: больше — это свайп, а не касание
+
+STATUS_VT, TOP_VT, CONSOLE_VT, MENU_VT, WIFI_VT = 1, 2, 3, 4, 5
+WIFI_JOIN = "/usr/local/bin/nura-wifi-join"
+WIFI_LOG = "/run/nura-wifi-join.log"
+WIFI_MAX = 6           # сколько сетей показывать (по силе сигнала)
+FONT = "ter-v32b"      # 16x32 -> 67x60; с удвоением (-d) 32x64 -> 33x30
+HTOP_CMD = ["htop", "--readonly", "--no-mouse", "-d", "20", "-s", "PERCENT_CPU"]
+ARROW = {UP: b"\x1b[A", DOWN: b"\x1b[B"}
+ENV = {"PATH": "/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin", "LANG": "C.UTF-8", "HOME": "/root"}
+
+# --- действия меню: (название, вопрос подтверждения, команда sh) ---
+CMD_CONTAINERS = r"""
+ids=$(docker ps -q)
+[ -n "$ids" ] && { echo "Перезапуск: $(echo $ids | wc -w) шт."; docker restart -t 20 $ids >/dev/null; }
+for c in $(docker ps -aq --filter status=exited --filter status=created); do
+  case $(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' $c) in
+    always|unless-stopped|on-failure) echo "Запуск: $(docker inspect -f '{{.Name}}' $c)"; docker start $c >/dev/null;;
+  esac
+done
+sleep 2
+docker ps -a --format '{{.Names}}|{{.State}}' | sed 's/|/  /'
+"""
+CMD_WIFI = r"""
+con=$(nmcli -g GENERAL.CONNECTION device show wlan0)
+if [ -n "$con" ]; then
+  echo "Переподключение: $con"; nmcli -w 40 connection up "$con" >/dev/null 2>&1
+else
+  echo "Подключение wlan0"; nmcli -w 40 device connect wlan0 >/dev/null 2>&1
+fi
+rc=$?
+sleep 3
+iw dev wlan0 link | sed -n 's/^[[:space:]]*\(SSID\|signal\): /\1 /p'
+echo "IP $(ip -4 -o addr show wlan0 | awk '{print $4}')"
+gw=$(ip -4 route show default dev wlan0 | awk '{print $3; exit}')
+if [ -n "$gw" ] && ping -c2 -W2 "$gw" >/dev/null; then echo "Шлюз $gw OK"; else echo "Шлюз не отвечает"; rc=1; fi
+exit $rc
+"""
+WIFI_ITEM = "wifi"       # особый пункт: свой экран со списком сетей
+MENU_ITEMS = [
+    ("Подключить к Wi-Fi", WIFI_ITEM, None),
+    ("Перезапустить контейнеры", "Перезапустить контейнеры?", CMD_CONTAINERS),
+    ("Переподключить Wi-Fi", "Переподключить Wi-Fi?", CMD_WIFI),
+    ("Перезагрузить", "Перезагрузить телефон?", "echo 'Перезагрузка...'; systemctl reboot"),
+    ("Выключить", "Выключить телефон?", "echo 'Выключение...'; systemctl poweroff"),
+    ("Назад", None, None),
+]
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def run(*cmd):
+    subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def find_device(name, prefix=False):
+    """Устройство ввода по имени; prefix=True — по началу имени."""
+    for path in sorted(glob.glob("/sys/class/input/event*/device/name")):
+        with open(path) as f:
+            n = f.read().strip()
+        if n == name or (prefix and n.startswith(name)):
+            return "/dev/input/" + path.split("/")[4]
+    return None
+
+
+def read_int(path):
+    with open(path) as f:
+        return int(f.read())
+
+
+def bright_step(direction):
+    cur = read_int(BL + "/brightness")
+    if direction > 0:
+        new = next((v for v in LEVELS if v > cur), LEVELS[-1])
+    else:
+        new = next((v for v in reversed(LEVELS) if v < cur), LEVELS[0])
+    new = min(new, read_int(BL + "/max_brightness"))
+    with open(BL + "/brightness", "w") as f:
+        f.write(str(new))
+
+
+def chvt(n):
+    run("chvt", str(n))
+
+
+class Top:
+    """htop в псевдотерминале, выведенный на tty2."""
+    tty_path = f"/dev/tty{TOP_VT}"
+
+    def __init__(self):
+        self.pid = self.master = self.out = None
+
+    def running(self):
+        return self.pid is not None
+
+    def start(self):
+        run("setfont", "-C", self.tty_path, FONT)
+        self.out = os.open(self.tty_path, os.O_RDWR | os.O_NOCTTY)
+        tty.setraw(self.out)
+        os.write(self.out, b"\x1b[?25l\x1b[2J\x1b[H")
+        winsz = fcntl.ioctl(self.out, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, cols = struct.unpack("HHHH", winsz)[:2]
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execvpe(HTOP_CMD[0], HTOP_CMD, dict(ENV, TERM="linux"))
+        fcntl.ioctl(master, termios.TIOCSWINSZ, winsz)
+        os.kill(pid, signal.SIGWINCH)
+        self.pid, self.master = pid, master
+        log(f"htop started pid={pid} size={cols}x{rows}")
+
+    def stop(self):
+        if self.pid:
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+                for _ in range(20):
+                    if os.waitpid(self.pid, os.WNOHANG)[0]:
+                        break
+                    time.sleep(0.05)
+                else:
+                    os.kill(self.pid, signal.SIGKILL)
+                    os.waitpid(self.pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+            log("htop stopped")
+        for fd in (self.master, self.out):
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+        self.pid = self.master = self.out = None
+
+    def pump(self):
+        try:
+            data = os.read(self.master, 65536)
+        except OSError as e:
+            if e.errno == errno.EIO:
+                return False
+            raise
+        if not data:
+            return False
+        os.write(self.out, data)
+        return True
+
+    def send(self, data):
+        if self.master is not None:
+            os.write(self.master, data)
+
+
+class Console:
+    """Вход в систему на tty3 + экранная клавиатура buffyboard."""
+    tty_path = f"/dev/tty{CONSOLE_VT}"
+    getty = f"getty@tty{CONSOLE_VT}.service"
+
+    def __init__(self):
+        self.kbd = None
+        self.started = 0.0
+
+    def start(self):
+        run("pkill", "-x", "buffyboard")     # две копии сразу шлют лишние нажатия
+        run("setfont", "-C", self.tty_path, FONT)
+        run("systemctl", "start", self.getty)
+        chvt(CONSOLE_VT)
+        # buffyboard уменьшает высоту только «занятого» терминала (ignore_unused_terminals),
+        # и getty при старте очищает экран — поэтому сначала даём getty открыть tty3
+        time.sleep(1.5)
+        self.kbd = subprocess.Popen(["buffyboard"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.started = time.time()
+        log(f"console started, buffyboard pid={self.kbd.pid}")
+
+    def sessions(self):
+        try:
+            out = subprocess.run(["loginctl", "list-sessions", "--json=short"],
+                                 capture_output=True, text=True, check=False).stdout
+            return [s["session"] for s in json.loads(out or "[]")
+                    if s.get("tty") == f"tty{CONSOLE_VT}"]
+        except (ValueError, KeyError):
+            return []
+
+    def stop(self):
+        if self.kbd:
+            self.kbd.terminate()
+            try:
+                self.kbd.wait(2)
+            except subprocess.TimeoutExpired:
+                self.kbd.kill()
+                self.kbd.wait()
+            self.kbd = None
+        for sid in self.sessions():
+            run("loginctl", "terminate-session", sid)
+            log(f"session {sid} on tty{CONSOLE_VT} terminated")
+        run("systemctl", "stop", self.getty)
+        log("console stopped")
+
+    def last_activity(self):
+        t = self.started
+        try:
+            t = max(t, os.stat(self.tty_path).st_atime)
+        except OSError:
+            pass
+        return t
+
+
+def nm_split(line):
+    """Разбор строки `nmcli -t`: поля через ':', двоеточие в значении экранировано '\\:'."""
+    out, cur, esc = [], "", False
+    for ch in line:
+        if esc:
+            cur += ch
+            esc = False
+        elif ch == "\\":
+            esc = True
+        elif ch == ":":
+            out.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    out.append(cur)
+    return out
+
+
+def wifi_scan():
+    """Список сетей: [{ssid, signal, secure, active, known}], сильные первыми."""
+    def nm(*args, timeout=25):
+        try:
+            return subprocess.run(["nmcli", *args], capture_output=True, text=True,
+                                  timeout=timeout, env=ENV).stdout
+        except subprocess.TimeoutExpired:
+            return ""
+    known = set()
+    for ln in nm("-t", "-f", "NAME,TYPE", "connection", "show").splitlines():
+        f = nm_split(ln)
+        if len(f) >= 2 and f[1] == "802-11-wireless":
+            known.add(f[0])
+    nets = {}
+    out = nm("-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi", "list",
+             "--rescan", "yes")
+    for ln in out.splitlines():
+        f = nm_split(ln)
+        if len(f) < 4 or not f[1]:
+            continue
+        sig = int(f[2]) if f[2].isdigit() else 0
+        n = nets.get(f[1])
+        if n is None or sig > n["signal"]:
+            nets[f[1]] = {"ssid": f[1], "signal": sig,
+                          "secure": f[3] not in ("", "--"),
+                          "active": f[0] == "*" or (n or {}).get("active", False),
+                          "known": f[1] in known}
+        elif f[0] == "*":
+            n["active"] = True
+    return sorted(nets.values(), key=lambda n: -n["signal"])[:WIFI_MAX]
+
+
+class WifiJoin:
+    """Ввод пароля новой сети на tty5 (nura-wifi-join + экранная клавиатура)."""
+    tty_path = f"/dev/tty{WIFI_VT}"
+
+    def __init__(self):
+        self.ssid = None
+        self.proc = None
+        self.kbd = None
+        self.started = 0.0
+
+    def start(self):
+        run("pkill", "-x", "buffyboard")
+        run("setfont", "-C", self.tty_path, "-d", FONT)   # крупно, как меню: 33 колонки
+        try:
+            os.unlink(WIFI_LOG)
+        except OSError:
+            pass
+        run("pkill", "-f", WIFI_JOIN)         # на случай зависшего прошлого запуска
+        # своя сессия (start_new_session): при отмене завершаем всю группу, вместе с nmcli.
+        # Не через утилиту setsid: лидер группы она форкает и сразу выходит с кодом 0.
+        self.proc = subprocess.Popen(
+            ["sh", "-c", f'exec {WIFI_JOIN} "$1" <>{self.tty_path} >&0 2>&0',
+             "sh", self.ssid], env=ENV, start_new_session=True)
+        chvt(WIFI_VT)
+        time.sleep(1.5)                       # как у консоли: buffyboard после открытия tty
+        self.kbd = subprocess.Popen(["buffyboard"], stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.started = time.time()
+        log(f"wifi join started: {self.ssid!r}")
+
+    def stop(self):
+        if self.kbd:
+            self.kbd.terminate()
+            try:
+                self.kbd.wait(2)
+            except subprocess.TimeoutExpired:
+                self.kbd.kill()
+                self.kbd.wait()
+            self.kbd = None
+        if self.proc and self.proc.poll() is None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait()
+        self.proc = None
+        log("wifi join stopped")
+
+    def finished(self):
+        """Код выхода помощника или None, пока он работает."""
+        return self.proc.poll() if self.proc else None
+
+    def result(self):
+        try:
+            with open(WIFI_LOG) as f:
+                return [ln.rstrip("\n") for ln in f if ln.strip()]
+        except OSError:
+            return ["Нет результата"]
+
+    def last_activity(self):
+        t = self.started
+        try:
+            t = max(t, os.stat(self.tty_path).st_atime)
+        except OSError:
+            pass
+        return t
+
+
+class Menu:
+    """Меню действий на tty4: выбор кнопками громкости, выполнение касанием."""
+    tty_path = f"/dev/tty{MENU_VT}"
+    COLS, ROWS = 33, 30
+    ROW_PX = 1920 // 30          # высота строки в пикселях (шрифт 32x64)
+    ITEM_TOP, ITEM_H, ITEM_GAP = 2, 2, 1       # 6 пунктов + запас, кнопка 128 px
+    YES_ROWS, NO_ROWS = range(8, 14), range(16, 22)
+
+    def __init__(self):
+        self.out = None
+        self.screen = "list"     # list | confirm | nets | run | result
+        self.title = ""
+        self.nets = []
+        self.sel = 0
+        self.confirm_yes = False
+        self.item = None
+        self.proc = None
+        self.lines = []
+        self.rc = None
+        self._buf = b""
+
+    # --- служебное ---
+    def start(self):
+        run("setfont", "-C", self.tty_path, "-d", FONT)
+        self.out = os.open(self.tty_path, os.O_WRONLY | os.O_NOCTTY)
+        self.screen, self.sel = "list", 0
+        chvt(MENU_VT)
+        self.draw()
+        log("menu started")
+
+    def stop(self):
+        if self.out is not None:
+            os.close(self.out)
+            self.out = None
+        log("menu stopped")
+
+    def busy(self):
+        return self.proc is not None
+
+    def w(self, s):
+        os.write(self.out, s.encode())
+
+    def at(self, row, text, style="0"):
+        text = text[:self.COLS]
+        self.w(f"\x1b[{row + 1};1H\x1b[{style}m{text}\x1b[K\x1b[0m")
+
+    def block(self, rows, label, style):
+        mid = rows[len(rows) // 2]
+        for r in rows:
+            txt = label.center(self.COLS) if r == mid else ""
+            self.w(f"\x1b[{r + 1};1H\x1b[{style}m{txt.ljust(self.COLS)}\x1b[0m")
+
+    def item_rows(self, i):
+        top = self.ITEM_TOP + i * (self.ITEM_H + self.ITEM_GAP)
+        return range(top, top + self.ITEM_H)
+
+    def entries(self):
+        """Число пунктов на текущем экране (для выбора кнопками)."""
+        return len(self.nets) + 1 if self.screen == "nets" else len(MENU_ITEMS)
+
+    @staticmethod
+    def net_label(n):
+        bars = "#" * (1 + n["signal"] // 25)
+        mark = " *" if n["active"] else (" +" if n["known"] else "")
+        lock = "" if n["secure"] else " open"
+        return f"{n['ssid'][:17]} {bars:<4}{lock}{mark}"
+
+    def show_result(self, title, lines, rc):
+        self.title, self.lines, self.rc, self.screen = title, lines, rc, "result"
+        self.draw()
+
+    def wifi_list(self):
+        self.title, self.screen = "Wi-Fi: поиск сетей", "run"
+        self.lines = ["Сканирование...", "", "Обычно 5-10 секунд"]
+        self.draw()
+        self.nets = wifi_scan()
+        log(f"wifi scan: {len(self.nets)} networks")
+        self.screen, self.sel = "nets", 0
+        self.draw()
+
+    # --- экраны ---
+    def draw(self):
+        self.w("\x1b[?25l\x1b[0m\x1b[2J")
+        if self.screen == "list":
+            self.at(0, " МЕНЮ", "1;33")
+            for i, (label, _, _) in enumerate(MENU_ITEMS):
+                style = "1;37;44" if i == self.sel else "30;47"
+                self.block(self.item_rows(i), label, style)
+            self.at(23, " VOL +/-: выбор", "1;37")
+            self.at(24, " Касание пункта: выполнить", "1;37")
+            self.at(25, " VOL+ дважды: выход", "1;37")
+            self.at(26, f" Без действий {IDLE_MENU} с: выход", "37")
+        elif self.screen == "nets":
+            self.at(0, " Wi-Fi: выберите сеть", "1;33")
+            if not self.nets:
+                self.at(3, " Сети не найдены", "1;31")
+            for i, n in enumerate(self.nets):
+                style = "1;37;44" if i == self.sel else "30;47"
+                self.block(self.item_rows(i), self.net_label(n), style)
+            back = len(self.nets)
+            self.block(self.item_rows(back), "Назад",
+                       "1;37;44" if self.sel == back else "30;47")
+            self.at(23, " # сигнал * текущая + сохранена", "37")
+            self.at(24, " VOL +/-: выбор", "1;37")
+            self.at(25, " Касание сети: подключить", "1;37")
+            self.at(26, " VOL+ дважды: выход", "1;37")
+        elif self.screen == "confirm":
+            self.at(0, " " + MENU_ITEMS[self.item][1], "1;33")
+            self.at(2, " Коснитесь ДА или НЕТ", "1;37")
+            yes_style = "1;37;41" if self.confirm_yes else "37;41"
+            no_style = "1;37;42" if not self.confirm_yes else "37;42"
+            self.block(self.YES_ROWS, ("> ДА <" if self.confirm_yes else "ДА"), yes_style)
+            self.block(self.NO_ROWS, ("> НЕТ <" if not self.confirm_yes else "НЕТ"), no_style)
+            self.at(24, " VOL +/-: выбор", "1;37")
+        else:
+            self.at(0, " " + self.title, "1;33")
+            for n, line in enumerate(self.lines[-20:]):
+                self.at(2 + n, " " + line)
+            if self.screen == "run":
+                self.at(24, " Выполняется...", "1;33")
+            else:
+                ok = self.rc == 0
+                self.at(24, " Готово" if ok else f" Ошибка (код {self.rc})", "1;32" if ok else "1;31")
+                self.at(26, " Касание: назад в меню", "1;37")
+
+    # --- ввод ---
+    def key(self, direction):
+        if self.screen in ("list", "nets"):
+            self.sel = (self.sel + direction) % self.entries()
+        elif self.screen == "confirm":
+            self.confirm_yes = not self.confirm_yes
+        elif self.screen == "result":
+            self.screen = "list"
+        else:
+            return
+        self.draw()
+
+    def touch(self, x, y):
+        """'exit' — пункт «Назад»; ('wifi', ssid) — нужен ввод пароля."""
+        row = y // self.ROW_PX
+        if self.screen == "list":
+            for i in range(len(MENU_ITEMS)):
+                if row in self.item_rows(i):
+                    self.sel = i
+                    if MENU_ITEMS[i][1] == WIFI_ITEM:
+                        self.wifi_list()
+                        return None
+                    if MENU_ITEMS[i][2] is None:
+                        return "exit"
+                    self.item, self.screen, self.confirm_yes = i, "confirm", False
+                    self.draw()
+                    return None
+        elif self.screen == "nets":
+            for i in range(len(self.nets) + 1):
+                if row in self.item_rows(i):
+                    self.sel = i
+                    if i == len(self.nets):
+                        self.screen, self.sel = "list", 0
+                        self.draw()
+                        return None
+                    return self.wifi_pick(self.nets[i])
+        elif self.screen == "confirm":
+            if row in self.YES_ROWS:
+                self.execute()
+            elif row in self.NO_ROWS:
+                self.screen = "list"
+                self.draw()
+        elif self.screen == "result":
+            self.screen = "list"
+            self.draw()
+        return None
+
+    def wifi_pick(self, n):
+        ssid = n["ssid"]
+        if n["active"]:
+            self.show_result("Wi-Fi: " + ssid, ["Уже подключено"], 0)
+            return None
+        if n["known"] or not n["secure"]:
+            # сохранённый профиль или открытая сеть — пароль не нужен
+            q = ssid.replace("'", "'\\''")
+            cmd = (f"nmcli -w 40 connection up id '{q}' >/dev/null 2>&1 || " if n["known"] else "") + \
+                  f"nmcli -w 40 device wifi connect '{q}' ifname wlan0 >/dev/null 2>&1; rc=$?; sleep 3; " \
+                  "echo \"IP $(ip -4 -o addr show wlan0 | awk '{print $4}')\"; exit $rc"
+            self.run_cmd("Wi-Fi: " + ssid, cmd)
+            return None
+        return ("wifi", ssid)
+
+    # --- выполнение ---
+    def execute(self):
+        label, _, cmd = MENU_ITEMS[self.item]
+        self.run_cmd(label, cmd)
+
+    def run_cmd(self, label, cmd):
+        log(f"menu action: {label}")
+        self.title = label
+        self.lines, self.rc, self.screen, self._buf = [], None, "run", b""
+        self.proc = subprocess.Popen(["sh", "-c", cmd], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=ENV)
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        self.draw()
+
+    def pump(self):
+        """Читать вывод выполняемой команды; по завершении показать результат."""
+        try:
+            data = os.read(self.proc.stdout.fileno(), 65536)
+        except BlockingIOError:
+            data = None
+        if data:
+            self._buf += data
+            *done, self._buf = self._buf.split(b"\n")
+            self.lines += [ln.decode(errors="replace") for ln in done]
+            self.draw()
+        if data == b"":
+            if self._buf:
+                self.lines.append(self._buf.decode(errors="replace"))
+                self._buf = b""
+            self.rc = self.proc.wait()
+            self.proc.stdout.close()
+            self.proc = None
+            self.screen = "result"
+            log(f"menu action done rc={self.rc}")
+            self.draw()
+
+    def fd(self):
+        return self.proc.stdout.fileno() if self.proc else None
+
+
+class Touch:
+    """Касания тачскрина (MT protocol B): (x, y) начала касания — при отпускании пальца."""
+
+    def __init__(self):
+        self.x = self.y = 0
+        self.down = False
+        self.start = None
+        self.lifted = False
+
+    def event(self, etype, code, value):
+        if etype == EV_ABS:
+            if code == ABS_MT_POSITION_X:
+                self.x = value
+            elif code == ABS_MT_POSITION_Y:
+                self.y = value
+        elif etype == EV_KEY and code == BTN_TOUCH:
+            self.down = bool(value)
+            if not value:
+                self.lifted = True
+        elif etype == EV_SYN and code == 0:
+            if self.down and self.start is None:
+                self.start = (self.x, self.y)
+            if self.lifted:
+                self.lifted = False
+                start, self.start = self.start, None
+                if start and abs(self.x - start[0]) + abs(self.y - start[1]) <= TAP_MAX_MOVE:
+                    return start
+        return None
+
+
+class Keys:
+    def __init__(self):
+        self.mode = "status"
+        self.top = Top()
+        self.console = Console()
+        self.menu = Menu()
+        self.wifi = WifiJoin()
+        self.down = set()
+        self.pending = None      # (key, t) — нажата, ещё не ясно: щелчок/удержание/комбо
+        self.tap_wait = None     # (key, t отпускания) — ждём второй щелчок
+        self.held = None
+        self.next_repeat = 0.0
+        self.lock = False        # после комбо/двойного — игнор до отпускания всех кнопок
+        self.last_input = time.monotonic()
+
+    # --- режимы ---
+    def set_mode(self, mode):
+        if mode == self.mode:
+            return
+        old = self.mode
+        if old == "top":
+            self.top.stop()
+        elif old == "console":
+            self.console.stop()
+        elif old == "menu":
+            self.menu.stop()
+        elif old == "wifi":
+            self.wifi.stop()
+        self.mode = mode
+        if mode == "top":
+            self.top.start()
+            chvt(TOP_VT)
+        elif mode == "console":
+            self.console.start()
+        elif mode == "menu":
+            self.menu.start()
+        elif mode == "wifi":
+            self.wifi.start()
+        else:
+            chvt(STATUS_VT)
+        log(f"mode {old} -> {mode}")
+
+    def has_double(self, key):
+        """Есть ли у кнопки в текущем режиме значение «двойное нажатие»."""
+        if self.mode in ("menu", "wifi"):
+            return key == UP
+        if self.mode == "console":
+            return key == DOWN
+        return True
+
+    def combo(self):
+        if self.mode == "menu" and self.menu.busy():
+            return
+        self.set_mode("top" if self.mode == "status" else "status")
+
+    def double(self, key):
+        if self.mode == "menu" and self.menu.busy():
+            return                   # не уходить, пока выполняется действие
+        if key == UP:
+            self.set_mode("status" if self.mode in ("menu", "wifi") else "menu")
+        else:
+            self.set_mode("status" if self.mode == "console" else "console")
+
+    def action(self, key):
+        d = +1 if key == UP else -1
+        if self.mode == "top":
+            self.top.send(ARROW[key] * SCROLL_LINES)
+        elif self.mode == "menu":
+            self.menu.key(-d)        # VOL+ — вверх по списку
+        else:
+            bright_step(d)
+
+    def repeat_interval(self):
+        return {"top": REPEAT_SCROLL, "menu": REPEAT_MENU}.get(self.mode, REPEAT_BRIGHT)
+
+    def flush_tap(self):
+        if self.tap_wait is not None:
+            key, _ = self.tap_wait
+            self.tap_wait = None
+            self.action(key)
+
+    # --- события кнопок ---
+    def on_key(self, code, value, now):
+        if code not in (UP, DOWN):
+            return
+        self.last_input = now
+        if value == 1:
+            self.down.add(code)
+            if self.lock:
+                return
+            if len(self.down) == 2:
+                self.pending = self.held = self.tap_wait = None
+                self.lock = True
+                self.combo()
+                return
+            if (self.tap_wait and self.tap_wait[0] == code
+                    and now - self.tap_wait[1] <= DOUBLE_WINDOW):
+                self.tap_wait = None
+                self.lock = True
+                self.double(code)
+                return
+            self.flush_tap()
+            self.pending = (code, now)
+        elif value == 0:
+            self.down.discard(code)
+            if self.pending and self.pending[0] == code:
+                self.pending = None
+                if self.has_double(code):
+                    self.tap_wait = (code, now)
+                else:
+                    self.action(code)
+            if self.held == code:
+                self.held = None
+            if not self.down:
+                self.lock = False
+
+    def on_touch(self, x, y, now):
+        if self.mode != "menu" or self.menu.busy():
+            return
+        self.last_input = now
+        r = self.menu.touch(x, y)
+        if r == "exit":
+            self.set_mode("status")
+        elif isinstance(r, tuple) and r[0] == "wifi":
+            self.wifi.ssid = r[1]
+            self.set_mode("wifi")
+
+    def wifi_done(self, rc):
+        """Помощник ввода пароля завершился: показать итог в меню."""
+        ssid, lines = self.wifi.ssid, self.wifi.result()
+        log(f"wifi join done rc={rc}")
+        self.set_mode("menu")
+        self.menu.show_result("Wi-Fi: " + ssid, lines, rc)
+
+    def pending_limit(self, key):
+        return HOLD_TIME if self.has_double(key) else COMBO_WINDOW
+
+    def tick(self, now):
+        if self.pending:
+            key, t0 = self.pending
+            if now - t0 >= self.pending_limit(key):
+                self.pending = None
+                self.action(key)
+                self.held = key
+                self.next_repeat = t0 + REPEAT_DELAY
+        if self.tap_wait is not None and now - self.tap_wait[1] > DOUBLE_WINDOW:
+            self.flush_tap()
+        if self.held and self.held in self.down and not self.lock and now >= self.next_repeat:
+            self.action(self.held)
+            self.next_repeat = now + self.repeat_interval()
+        if self.mode == "top" and now - self.last_input >= IDLE_TOP:
+            log("htop idle -> status")
+            self.set_mode("status")
+        if self.mode == "console":
+            idle = min(time.time() - self.console.last_activity(), now - self.last_input)
+            if idle >= IDLE_CONSOLE:
+                log("console idle -> logout, status")
+                self.set_mode("status")
+        if self.mode == "wifi":
+            idle = min(time.time() - self.wifi.last_activity(), now - self.last_input)
+            if idle >= IDLE_WIFI:
+                log("wifi join idle -> status")
+                self.set_mode("status")
+        if self.mode == "menu":
+            if self.menu.busy():
+                self.last_input = now    # пока выполняется действие, не выходим
+            elif now - self.last_input >= IDLE_MENU:
+                log("menu idle -> status")
+                self.set_mode("status")
+
+    def timeout(self, now):
+        t = []
+        if self.pending:
+            key, t0 = self.pending
+            t.append(t0 + self.pending_limit(key) - now)
+        if self.tap_wait is not None:
+            t.append(self.tap_wait[1] + DOUBLE_WINDOW - now + 0.001)
+        if self.held and self.held in self.down:
+            t.append(self.next_repeat - now)
+        if self.mode == "top":
+            t.append(self.last_input + IDLE_TOP - now)
+        if self.mode == "console":
+            t.append(5.0)            # простой консоли и жив ли buffyboard
+        if self.mode in ("menu", "wifi"):
+            t.append(1.0)            # простой меню, завершение ввода пароля
+        return max(0.0, min(t)) if t else None
+
+
+def read_events(fd):
+    data = os.read(fd, EV_SIZE * 64)
+    for i in range(0, len(data) - EV_SIZE + 1, EV_SIZE):
+        yield struct.unpack(EV_FMT, data[i:i + EV_SIZE])[2:]
+
+
+def main():
+    keys_dev = None
+    while keys_dev is None:
+        keys_dev = find_device("gpio-keys")
+        if keys_dev is None:
+            time.sleep(2)
+    touch_dev = find_device("Synaptics", prefix=True)   # bacon: s3508, Nexus 5: PLG218
+    log(f"input: keys {keys_dev}, touch {touch_dev}")
+    k = Keys()
+    touch = Touch()
+
+    def on_term(*_):
+        k.set_mode("status")
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, on_term)
+    sig_r, sig_w = os.pipe()
+    os.set_blocking(sig_r, False)
+    os.set_blocking(sig_w, False)
+    signal.set_wakeup_fd(sig_w)
+    for s in (signal.SIGUSR1, signal.SIGUSR2, signal.SIGHUP):
+        signal.signal(s, lambda *a: None)
+    run("systemctl", "stop", Console.getty)  # на случай перезапуска из режима консоли
+
+    evfd = os.open(keys_dev, os.O_RDONLY)
+    tfd = os.open(touch_dev, os.O_RDONLY) if touch_dev else None
+    while True:
+        now = time.monotonic()
+        fds = [evfd, sig_r]
+        if tfd is not None:
+            fds.append(tfd)
+        if k.top.running():
+            fds.append(k.top.master)
+        if k.menu.fd() is not None:
+            fds.append(k.menu.fd())
+        r, _, _ = select.select(fds, [], [], k.timeout(now))
+        now = time.monotonic()
+        if sig_r in r:
+            for s in os.read(sig_r, 64):
+                k.last_input = now
+                if s == signal.SIGUSR1:
+                    k.combo()
+                elif s == signal.SIGUSR2:
+                    k.double(DOWN)
+                elif s == signal.SIGHUP:
+                    k.double(UP)
+        if evfd in r:
+            for etype, code, value in read_events(evfd):
+                if etype == EV_KEY:
+                    k.on_key(code, value, now)
+        if tfd is not None and tfd in r:
+            for etype, code, value in read_events(tfd):
+                pos = touch.event(etype, code, value)
+                if pos:
+                    k.on_touch(pos[0], pos[1], now)
+        if k.top.running() and k.top.master in r:
+            if not k.top.pump():
+                log("htop exited")
+                k.set_mode("status")
+        if k.menu.fd() is not None and k.menu.fd() in r:
+            k.menu.pump()
+        if k.mode == "wifi":
+            rc = k.wifi.finished()
+            if rc is not None:
+                k.wifi_done(rc)
+            elif k.wifi.kbd and k.wifi.kbd.poll() is not None:
+                log("buffyboard exited -> status")
+                k.set_mode("status")
+        if k.mode == "console" and k.console.kbd and k.console.kbd.poll() is not None:
+            log("buffyboard exited -> status")
+            k.set_mode("status")
+        k.tick(now)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,152 @@
+#!/bin/sh
+# nura-status: текстовый экран состояния на tty1 вместо Phosh (без GPU).
+# Один скрипт для OnePlus One (bacon) и Nexus 5 (hammerhead): светодиод и батарея определяются сами.
+# Рисует через fbcon, поэтому драйвер msm не создаёт GEM-буферы,
+# и баг msm_gem_purge не срабатывает.
+TTY=/dev/tty1
+INTERVAL=10
+BLANK_MIN=1
+
+G='\033[1;32m'; R='\033[1;31m'; Y='\033[1;33m'; D='\033[0;37m'; W='\033[1;37m'; N='\033[0m'
+
+# Основной пользователь (первый с UID >= 10000, как в postmarketOS)
+USR=$(awk -F: '$3>=10000 && $3<60000 {print $1; exit}' /etc/passwd)
+HOM=$(awk -F: -v u="$USR" '$1==u {print $6}' /etc/passwd)
+
+# Крупный шрифт: 16x32 удвоенный до 32x64 (33x30 символов), при отказе — без удвоения
+setfont -C "$TTY" -d ter-v32b 2>/dev/null || setfont -C "$TTY" ter-v32b 2>/dev/null
+chvt 1
+# Скрыть курсор, гасить экран через BLANK_MIN мин (любая кнопка его включает)
+printf '\033[?25l\033[9;%s]\033[2J' "$BLANK_MIN" >"$TTY"
+
+# --- RGB-светодиод: короткая вспышка, чтобы было видно при погашенном экране ---
+#   зелёный раз в 5 с  — всё в порядке
+#   жёлтый  раз в 2 с  — батарея < 20% без зарядки
+#   красный раз в 1 с  — нет Wi-Fi / шлюза / интернета, не все контейнеры, CPU >= 75 C
+LEDS=/sys/class/leds
+LED_LAST=""
+led() {   # led <state> <R> <G> <B> <период мс>   (R G B в шкале 0..255)
+  [ "$1" = "$LED_LAST" ] && return
+  LED_LAST=$1
+  if [ -e $LEDS/rgb:status/multi_intensity ]; then
+    # Nexus 5: один многоцветный светодиод. Цвет задаёт multi_intensity (0..max),
+    # мигание — pattern по общей яркости (модуль ledtrig-pattern).
+    m=$(cat $LEDS/rgb:status/max_brightness)
+    grep -q '\[pattern\]' $LEDS/rgb:status/trigger || echo pattern > $LEDS/rgb:status/trigger
+    echo "$(( $2 * m / 255 )) $(( $3 * m / 255 )) $(( $4 * m / 255 ))" > $LEDS/rgb:status/multi_intensity
+    echo "$m 120 $m 0 0 $(( $5 - 120 )) 0 0" > $LEDS/rgb:status/pattern
+    return
+  fi
+  # bacon: три отдельных канала. Только триггер pattern: udev-правило feedbackd
+  # (72-feedbackd.rules) всё равно возвращает его при любом изменении.
+  # Выключенный канал = шаблон из нулей.
+  for c in red green blue; do
+    case $c in red) v=$2;; green) v=$3;; blue) v=$4;; esac
+    grep -q '\[pattern\]' $LEDS/$c:status/trigger || echo pattern > $LEDS/$c:status/trigger
+    # пары «яркость длительность_мс»: вспышка 120 мс, затем пауза до периода
+    echo "$v 120 $v 0 0 $(( $5 - 120 )) 0 0" > $LEDS/$c:status/pattern
+  done
+}
+
+# Чип светодиода иногда не отвечает при загрузке (-ENXIO), и драйвер не подключается.
+# Пробуем подключить заново; после успеха LED_LAST сброшен, и шаблон запишется снова.
+led_heal() {
+  [ -e $LEDS/red:status ] || [ -e $LEDS/rgb:status ] && return
+  [ -d /sys/bus/i2c/drivers/leds-is31fl319x ] || return     # только bacon
+  LED_LAST=""
+  echo 1-0068 > /sys/bus/i2c/drivers/leds-is31fl319x/bind 2>/dev/null
+}
+
+line() { printf "%b\033[K\n" "$*"; }
+# Пинг: 3 пакета через 0,3 с; печатает число ответов (0..3).
+# Один пакет давал ложные FAIL: Wi-Fi теряет ~2-3% пакетов (раздел 17.6).
+pings() { ping -c3 -i 0.3 -W2 -q "$1" 2>/dev/null | awk '/packets received/{print $4}'; }
+ok()   { case "${1:-0}" in 3) printf "${G}OK${N}";; 0) printf "${R}FAIL${N}";; *) printf "${Y}LOSS${N}";; esac; }
+BAD_STREAK=0
+
+while :; do
+  {
+    printf '\033[H'
+    up=$(awk '{s=int($1); printf "%dd %dh%02dm", s/86400, s%86400/3600, s%3600/60}' /proc/uptime)
+    line "${Y}$(hostname)${N}  $(date '+%d.%m %H:%M')"
+    line "${D}up ${up}${N}"
+    line "User ${W}${USR}${N}"
+    line "Home ${W}${HOM}${N} $(df -h "$HOM" 2>/dev/null | awk 'NR==2{print $4" free"}')"
+    line ""
+
+    # Wi-Fi
+    link=$(iw dev wlan0 link 2>/dev/null)
+    ssid=$(echo "$link" | sed -n 's/^[[:space:]]*SSID: //p')
+    sig=$(echo "$link" | sed -n 's/^[[:space:]]*signal: \(-*[0-9]*\).*/\1/p')
+    if [ -n "$ssid" ]; then
+      line "WiFi ${G}${ssid}${N}"
+      line "     ${sig} dBm"
+    else
+      line "WiFi ${R}NOT CONNECTED${N}"
+      line ""
+    fi
+    ip4=$(ip -4 -o addr show wlan0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+    line "IP   ${ip4:-${R}-${N}}"
+    gw=$(ip -4 route show default dev wlan0 2>/dev/null | awk '{print $3; exit}')
+    if [ -n "$gw" ]; then g=$(pings "$gw"); else g=0; fi
+    i=$(pings 8.8.8.8)
+    line "GW   $(ok $g)  NET $(ok $i)"
+    usb=$(ip -4 -o addr show usb0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+    line "USB  ${usb:--}"
+    line ""
+
+    # Docker
+    run=$(docker ps -q --filter status=running 2>/dev/null | wc -l); all=$(docker ps -aq 2>/dev/null | wc -l)
+    if [ "$run" = "$all" ]; then c=$G; else c=$R; fi
+    line "Dock ${c}${run}/${all}${N} running"
+
+    # Батарея и зарядка
+    # первый power_supply с type=Battery (bacon: bq27541-0, Nexus 5: battery)
+    b=$(for p in /sys/class/power_supply/*; do [ "$(cat $p/type 2>/dev/null)" = Battery ] && { echo $p; break; }; done)
+    cap=$(cat $b/capacity 2>/dev/null); st=$(cat $b/status 2>/dev/null)
+    chg=$(cat /sys/class/power_supply/bq24190-charger/online 2>/dev/null)
+    # у Nexus 5 status иногда возвращает число вместо слова — берём по зарядному
+    case "$st" in [A-Z]*) ;; *) [ "$chg" = 1 ] && st=Charging || st=Discharging;; esac
+    [ "${cap:-0}" -lt 20 ] && c=$R || c=$G
+    line "Bat  ${c}${cap}%${N} ${st}"
+    [ "$chg" = 1 ] && line "     ${D}cable in${N}" || line "     ${D}no cable${N}"
+
+    # Температура CPU (максимум по ядрам) и память
+    t=0
+    for z in /sys/class/thermal/thermal_zone*; do
+      case $(cat $z/type) in cpu*) v=$(cat $z/temp); [ "$v" -gt "$t" ] && t=$v;; esac
+    done
+    t=$((t/1000)); [ $t -ge 75 ] && c=$R || c=$G
+    line "CPU  ${c}${t}C${N}  load $(cut -d' ' -f1 /proc/loadavg)"
+    # Состояние для светодиода
+    # Красный — только если проблема держится 2 цикла подряд (~20 с):
+    # одиночная потеря пакетов или перезапуск контейнера не дают ложной тревоги
+    led_heal
+    if [ -z "$ssid" ] || [ "${g:-0}" = 0 ] || [ "${i:-0}" = 0 ] || [ "$run" != "$all" ] || [ $t -ge 75 ]; then
+      BAD_STREAK=$((BAD_STREAK + 1))
+    else
+      BAD_STREAK=0
+    fi
+    if [ $BAD_STREAK -ge 2 ]; then
+      led bad 60 0 0 1000
+    elif [ "${cap:-100}" -lt 20 ] && [ "$st" != Charging ]; then
+      led warn 60 25 0 2000
+    else
+      led ok 0 30 0 5000
+    fi
+    line "RAM  $(awk '/MemAvailable/{a=$2}/LowFree/{l=$2}END{printf "%dM free, low %dM", a/1024, l/1024}' /proc/meminfo)"
+    line ""
+    br=$(cat /sys/class/backlight/lcd-backlight/brightness 2>/dev/null)
+    line "Lght $((br*100/255))%"
+    line ""
+    line "${W}VOL +/-: brightness${N}"
+    line "${W}VOL + and -: htop${N}"
+    line "${W}VOL - twice: console${N}"
+    line "${W}VOL + twice: menu${N}"
+    line "${W}POWER tap: screen on${N}"
+    line "${W}  (auto off after ${BLANK_MIN} min)${N}"
+    line "${W}POWER hold 5s: reboot${N}"
+    printf '\033[J'
+  } >"$TTY" 2>/dev/null
+  sleep "$INTERVAL"
+done

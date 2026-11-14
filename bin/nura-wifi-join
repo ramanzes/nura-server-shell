@@ -1,0 +1,50 @@
+#!/bin/sh
+# nura-wifi-join <SSID>: ввод пароля новой сети Wi-Fi и подключение.
+# Запускается из nura-keys на tty5 вместе с экранной клавиатурой buffyboard.
+# Итог (2-4 строки) пишется в /run/nura-wifi-join.log — его показывает меню.
+# Код выхода: 0 — подключено, 1 — ошибка, 2 — отменено.
+SSID=$1
+LOG=/run/nura-wifi-join.log
+: > "$LOG"
+
+printf '\033[2J\033[H\033[?25h'
+printf '\033[1;33m Wi-Fi: %s\033[0m\n\n' "$SSID"
+printf ' Введите пароль и нажмите Enter.\n'
+printf ' Пустой пароль — отмена.\n'
+printf ' Отмена: VOL+ дважды.\n\n'
+printf '\033[1;37m Пароль: \033[0m'
+IFS= read -r PW
+if [ -z "$PW" ]; then
+  echo "Отменено" > "$LOG"
+  exit 2
+fi
+if [ ${#PW} -lt 8 ]; then
+  echo "Пароль короче 8 символов" > "$LOG"
+  echo "WPA требует от 8 символов" >> "$LOG"
+  exit 1
+fi
+
+printf '\n Подключение...\n'
+had=$(nmcli -g NAME connection show | grep -Fx -- "$SSID")
+out=$(nmcli -w 45 device wifi connect "$SSID" password "$PW" ifname wlan0 2>&1)
+rc=$?
+PW=""
+if [ $rc -eq 0 ]; then
+  sleep 3
+  echo "Подключено: $SSID" > "$LOG"
+  echo "IP $(ip -4 -o addr show wlan0 | awk '{print $4}')" >> "$LOG"
+  sig=$(iw dev wlan0 link | sed -n 's/^[[:space:]]*signal: \(-*[0-9]*\).*/\1/p')
+  [ -n "$sig" ] && echo "Сигнал $sig dBm" >> "$LOG"
+else
+  # новый профиль с неверным паролем не оставляем
+  [ -z "$had" ] && nmcli connection delete id "$SSID" >/dev/null 2>&1
+  case $out in
+    *ecrets*|*802-1X*|*supplicant*) echo "Неверный пароль?" > "$LOG" ;;
+    *"No network"*|*"not found"*)   echo "Сеть не найдена" > "$LOG" ;;
+    *)                              echo "Не удалось подключиться" > "$LOG" ;;
+  esac
+  echo "$out" | sed 's/^Error: //' | cut -c1-60 | tail -2 >> "$LOG"
+fi
+cat "$LOG"
+sleep 2
+exit $rc
