@@ -67,7 +67,10 @@ IDLE_MENU = 45         # с: меню без действий -> табло (э�
 IDLE_WIFI = 300        # с: ввод пароля Wi-Fi без действий -> табло
 
 # --- блокировка экрана паролем пользователя ---
-LOCK_VT = 7
+# Экран блокировки — на tty5 (общий с вводом пароля Wi-Fi: эти режимы не бывают
+# одновременно). buffyboard уменьшает высоту только консолей 1..6; на tty7 текст
+# занимал весь экран, и перерисовка затирала клавиатуру.
+LOCK_VT = 5
 LOCK_FAILS_MAX = 5     # неверных паролей подряд -> пауза
 LOCK_LOCKOUT = 300     # с: пауза после LOCK_FAILS_MAX ошибок
 LOCK_DELAY = 2.0       # с: задержка после каждой ошибки
@@ -77,7 +80,7 @@ FAILS_FILE = "/var/lib/nura-server-shell/lock-fails"
 FB_BLANK = "/sys/class/graphics/fb0/blank"
 KEY_POWER = 116
 VT_LOCKSWITCH, VT_UNLOCKSWITCH = 0x560B, 0x560C
-TIOCLINUX, TIOCL_BLANKSCREEN = 0x541C, 14
+TIOCLINUX, TIOCL_UNBLANKSCREEN, TIOCL_BLANKSCREEN = 0x541C, 4, 14
 TAP_MAX_MOVE = 120     # px: больше — это свайп, а не касание
 
 STATUS_VT, TOP_VT, CONSOLE_VT, MENU_VT, WIFI_VT = 1, 2, 3, 4, 5
@@ -292,15 +295,25 @@ def vt_lockswitch(on):
         log(f"lock: VT_{'LOCK' if on else 'UNLOCK'}SWITCH failed: {e}")
 
 
-def screen_blank():
+def _tioclinux(cmd):
     try:
         fd = os.open("/dev/tty0", os.O_RDWR | os.O_NOCTTY)
         try:
-            fcntl.ioctl(fd, TIOCLINUX, bytes([TIOCL_BLANKSCREEN]))
+            fcntl.ioctl(fd, TIOCLINUX, bytes([cmd]))
         finally:
             os.close(fd)
     except OSError:
         pass
+
+
+def screen_blank():
+    """Погасить экран. Внимание: после TIOCL_BLANKSCREEN ядро НЕ включает экран
+    по нажатию клавиш — включаем сами (screen_unblank) на любое нажатие или касание."""
+    _tioclinux(TIOCL_BLANKSCREEN)
+
+
+def screen_unblank():
+    _tioclinux(TIOCL_UNBLANKSCREEN)
 
 
 def screen_blanked():
@@ -370,7 +383,14 @@ class Lock:
     def keyboard_alive(self):
         return self.kbd is not None and self.kbd.poll() is None
 
-    def restart_keyboard(self):
+    def restart_keyboard(self, kill=False):
+        if kill and self.kbd and self.kbd.poll() is None:
+            self.kbd.terminate()
+            try:
+                self.kbd.wait(2)
+            except subprocess.TimeoutExpired:
+                self.kbd.kill()
+                self.kbd.wait()
         self.kbd = subprocess.Popen(buffyboard_cmd(0), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -1197,6 +1217,8 @@ class Keys:
         self.lock_enabled = conf.get("LOCK", "1") != "0"
         self.locker = Lock(conf.get("LOCK_USER") or main_user())
         self.blank_at = None
+        self.forced_blank = False    # экран погашен нами (TIOCL_BLANKSCREEN)
+        self.was_blank = False       # для перезапуска клавиатуры после включения экрана
         self.down = set()
         self.pending = None      # (key, t) — нажата, ещё не ясно: щелчок/удержание/комбо
         self.tap_wait = None     # (key, t отпускания) — ждём второй щелчок
@@ -1292,11 +1314,27 @@ class Keys:
             self.action(key)
 
     # --- события кнопок ---
+    def wake(self):
+        """Любое нажатие или касание после нашего гашения — включить экран."""
+        if self.forced_blank:
+            self.forced_blank = False
+            self.blank_at = None
+            screen_unblank()
+            return True
+        return False
+
     def on_key(self, code, value, now):
         if code == KEY_POWER:
-            if value == 1:               # коротко: погасить экран и заблокировать
-                self.do_lock(blank=True)
+            if value == 1:
+                if self.wake():          # погашен нами -> включить
+                    return
+                if self.mode == "lock":  # экран блокировки включён -> погасить
+                    self.blank_at = time.monotonic()
+                else:                    # коротко: погасить экран и заблокировать
+                    self.do_lock(blank=True)
             return
+        if value == 1 and self.wake():
+            return                       # нажатие только будит экран
         if code not in (UP, DOWN):
             return
         self.last_input = now
@@ -1331,6 +1369,8 @@ class Keys:
                 self.lock = False
 
     def on_touch(self, x, y, now):
+        if self.wake():
+            return
         if self.mode == "lock":
             return                       # касания — только экранной клавиатуре
         if self.mode == "top":
@@ -1373,13 +1413,22 @@ class Keys:
             self.next_repeat = now + self.repeat_interval()
         if self.blank_at is not None and now >= self.blank_at:
             self.blank_at = None
+            self.forced_blank = True
             screen_blank()
+        blank = screen_blanked()
+        if self.forced_blank and not blank:
+            self.forced_blank = False    # экран включил кто-то другой
         if self.mode == "lock":
             self.locker.tick()
             if not self.locker.keyboard_alive():
                 self.locker.restart_keyboard()
+            elif self.was_blank and not blank:
+                # после включения экрана ядро перерисовывает консоль — клавиатуру заново
+                self.locker.restart_keyboard(kill=True)
+            self.was_blank = blank
             return
-        if self.lock_enabled and screen_blanked():
+        self.was_blank = blank
+        if self.lock_enabled and blank:
             log("screen blanked -> lock")
             self.do_lock()
             if self.mode == "lock":
