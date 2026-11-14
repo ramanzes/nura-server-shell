@@ -90,5 +90,6 @@ install.sh, uninstall.sh
 
 ## Лицензия
 
-Двойная лицензия — по вашему выбору **Apache License 2.0** ([LICENSE-APACHE](LICENSE-APACHE)) или **GNU GPL v3** ([LICENSE-GPL3](LICENSE-GPL3)).
-`SPDX-License-Identifier: Apache-2.0 OR GPL-3.0-only`
+**GNU General Public License v3.0** — см. [LICENSE](LICENSE). `SPDX-License-Identifier: GPL-3.0-only`
+
+Можно свободно использовать, изменять и распространять, в том числе на продаваемых устройствах, при условии, что изменённая версия тоже распространяется под GPL v3 с открытым исходным кодом.

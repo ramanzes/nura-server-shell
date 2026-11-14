@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0 OR GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 ramanzes — https://github.com/ramanzes/nura-server-shell
 # nura-status: текстовый экран состояния на tty1 вместо Phosh (без GPU).
 # Один скрипт для OnePlus One (bacon) и Nexus 5 (hammerhead): светодиод и батарея определяются сами.

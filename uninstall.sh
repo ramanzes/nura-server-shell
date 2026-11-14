@@ -1,5 +1,5 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0 OR GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-only
 # Copyright (c) 2026 ramanzes — https://github.com/ramanzes/nura-server-shell
 # nura-server-shell — удаление. Пакеты (python3, htop, ...) не удаляются.
 #   sudo ./uninstall.sh [--restore-gui]
