@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0 OR GPL-3.0-only
+# Copyright (c) 2026 ramanzes — https://github.com/ramanzes/nura-server-shell
 # nura-server-shell — установка серверной оболочки для телефона на Nura (postmarketOS).
 #
 #   wget -qO- https://raw.githubusercontent.com/ramanzes/nura-server-shell/main/install.sh | sudo sh
@@ -14,7 +16,7 @@ HEADLESS=0
 for a in "$@"; do
   case $a in
     --headless) HEADLESS=1 ;;
-    -h|--help) sed -n '2,9p' "$0" 2>/dev/null || true; exit 0 ;;
+    -h|--help) sed -n '4,11p' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "Неизвестный параметр: $a" >&2; exit 2 ;;
   esac
 done

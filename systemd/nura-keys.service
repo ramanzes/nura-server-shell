@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0 OR GPL-3.0-only
 [Unit]
 Description=Volume keys: brightness, htop screen toggle (VOL+ and VOL- together)
 After=systemd-backlight@backlight:lcd-backlight.service nura-status.service

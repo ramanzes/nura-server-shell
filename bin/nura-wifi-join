@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0 OR GPL-3.0-only
+# Copyright (c) 2026 ramanzes — https://github.com/ramanzes/nura-server-shell
 # nura-wifi-join <SSID>: ввод пароля новой сети Wi-Fi и подключение.
 # Запускается из nura-keys на tty5 вместе с экранной клавиатурой buffyboard.
 # Итог (2-4 строки) пишется в /run/nura-wifi-join.log — его показывает меню.
