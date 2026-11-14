@@ -68,6 +68,12 @@ WIFI_JOIN = "/usr/local/bin/nura-wifi-join"
 WIFI_LOG = "/run/nura-wifi-join.log"
 WIFI_MAX = 6           # сколько сетей показывать (по силе сигнала)
 FONT = "ter-v32b"      # 16x32 -> 67x60; с удвоением (-d) 32x64 -> 33x30
+TOP_FONT_PORTRAIT = "ter-v24b"   # 12x24 -> 90x80: строка F1..F10 htop (81 колонка) помещается
+SCREEN_W, SCREEN_H = 1080, 1920  # кадровый буфер в портретной ориентации
+ROT_FILE = "/var/lib/nura-server-shell/rotate"   # 0 — портрет, 1 — альбом (htop и консоль)
+# F1..F10 для TERM=linux (htop запущен с ним)
+FKEYS = [b"\x1b[[A", b"\x1b[[B", b"\x1b[[C", b"\x1b[[D", b"\x1b[[E",
+         b"\x1b[17~", b"\x1b[18~", b"\x1b[19~", b"\x1b[20~", b"\x1b[21~"]
 # без --readonly: с клавиатурой работают kill (k/F9), nice (F7/F8), фильтр и т. д.
 HTOP_CMD = ["htop", "--no-mouse", "-d", "20", "-s", "PERCENT_CPU"]
 ARROW = {UP: b"\x1b[A", DOWN: b"\x1b[B"}
@@ -101,8 +107,10 @@ if [ -n "$gw" ] && ping -c2 -W2 "$gw" >/dev/null; then echo "Шлюз $gw OK"; e
 exit $rc
 """
 WIFI_ITEM = "wifi"       # особый пункт: свой экран со списком сетей
+ROT_ITEM = "rotate"      # особый пункт: портрет/альбом для htop и консоли
 MENU_ITEMS = [
     ("Подключить к Wi-Fi", WIFI_ITEM, None),
+    ("Ориентация htop/консоли", ROT_ITEM, None),
     ("Перезапустить контейнеры", "Перезапустить контейнеры?", CMD_CONTAINERS),
     ("Переподключить Wi-Fi", "Переподключить Wi-Fi?", CMD_WIFI),
     ("Перезагрузить", "Перезагрузить телефон?", "echo 'Перезагрузка...'; systemctl reboot"),
@@ -149,6 +157,53 @@ def chvt(n):
     run("chvt", str(n))
 
 
+def get_rotation():
+    try:
+        with open(ROT_FILE) as f:
+            rot = 1 if f.read().strip() == "1" else 0
+    except OSError:
+        return 0
+    return rot if rot == 0 or rotation_supported() else 0
+
+
+def set_rotation(rot):
+    os.makedirs(os.path.dirname(ROT_FILE), exist_ok=True)
+    with open(ROT_FILE, "w") as f:
+        f.write(f"{rot}\n")
+
+
+def fbcon_rotate(rot):
+    """Повернуть текущую (активную) консоль: 0 — портрет, 1 — на 90° по часовой."""
+    try:
+        with open("/sys/class/graphics/fbcon/rotate", "w") as f:
+            f.write(str(rot))
+    except OSError:
+        pass
+
+
+def rotation_supported():
+    """Умеет ли ядро поворачивать консоль (CONFIG_FRAMEBUFFER_CONSOLE_ROTATION)."""
+    import gzip
+    for path, opener in (("/proc/config.gz", gzip.open), ("/boot/config", open)):
+        try:
+            with opener(path, "rt") as f:
+                return any(ln.strip() == "CONFIG_FRAMEBUFFER_CONSOLE_ROTATION=y" for ln in f)
+        except OSError:
+            continue
+    return False
+
+
+def buffyboard_cmd(rot):
+    return ["buffyboard", f"--rotate={rot}"]
+
+
+def to_logical(x, y, rot):
+    """Координаты касания (портрет) -> координаты на повёрнутой консоли."""
+    if rot == 1:                 # по часовой: верх консоли — правый край телефона
+        return y, SCREEN_W - 1 - x
+    return x, y
+
+
 class Top:
     """htop в псевдотерминале, выведенный на tty2.
 
@@ -167,12 +222,19 @@ class Top:
         return self.pid is not None
 
     def start(self):
-        run("setfont", "-C", self.tty_path, FONT)
+        self.rot = get_rotation()
+        # портрет — мелкий шрифт (90 колонок, видна вся строка F1..F10), альбом — обычный (120)
+        run("setfont", "-C", self.tty_path, FONT if self.rot else TOP_FONT_PORTRAIT)
+        chvt(TOP_VT)
+        fbcon_rotate(self.rot)
         self.out = os.open(self.tty_path, os.O_RDWR | os.O_NOCTTY)
         tty.setraw(self.out)
         os.write(self.out, b"\x1b[?25l\x1b[2J\x1b[H")
         winsz = fcntl.ioctl(self.out, termios.TIOCGWINSZ, b"\0" * 8)
         rows, cols = struct.unpack("HHHH", winsz)[:2]
+        # размер символа — по полному размеру терминала (до появления клавиатуры)
+        lw, lh = (SCREEN_H, SCREEN_W) if self.rot else (SCREEN_W, SCREEN_H)
+        self.cell = (lw // max(cols, 1), lh // max(rows, 1))
         pid, master = pty.fork()
         if pid == 0:
             os.execvpe(HTOP_CMD[0], HTOP_CMD, dict(ENV, TERM="linux"))
@@ -190,9 +252,22 @@ class Top:
             self.hide_keyboard()
         else:
             run("pkill", "-x", "buffyboard")
-            self.kbd = subprocess.Popen(["buffyboard"], stdin=subprocess.DEVNULL,
+            self.kbd = subprocess.Popen(buffyboard_cmd(self.rot), stdin=subprocess.DEVNULL,
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             log(f"htop keyboard on, buffyboard pid={self.kbd.pid}")
+
+    def tap(self, x, y):
+        """Касание строки функций htop (последняя строка) -> F1..F10."""
+        if self.winsz is None:
+            return
+        rows, cols = struct.unpack("HHHH", self.winsz)[:2]
+        lx, ly = to_logical(x, y, self.rot)
+        cw, ch = self.cell
+        if ly // ch != rows - 1:
+            return
+        n = min(lx // cw // 8, 9)    # пункты по 8 колонок: «F1Help  », ..., «F10Quit»
+        self.send(FKEYS[n])
+        log(f"htop tap -> F{n + 1}")
 
     def hide_keyboard(self):
         if self.kbd:
@@ -286,10 +361,12 @@ class Console:
         run("setfont", "-C", self.tty_path, FONT)
         run("systemctl", "start", self.getty)
         chvt(CONSOLE_VT)
+        self.rot = get_rotation()
+        fbcon_rotate(self.rot)
         # buffyboard уменьшает высоту только «занятого» терминала (ignore_unused_terminals),
         # и getty при старте очищает экран — поэтому сначала даём getty открыть tty3
         time.sleep(1.5)
-        self.kbd = subprocess.Popen(["buffyboard"], stdin=subprocess.DEVNULL,
+        self.kbd = subprocess.Popen(buffyboard_cmd(self.rot), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.started = time.time()
         log(f"console started, buffyboard pid={self.kbd.pid}")
@@ -596,6 +673,21 @@ class Menu:
                     if MENU_ITEMS[i][1] == WIFI_ITEM:
                         self.wifi_list()
                         return None
+                    if MENU_ITEMS[i][1] == ROT_ITEM:
+                        if not rotation_supported():
+                            self.show_result("Ориентация htop и консоли", [
+                                "Ядро не умеет поворачивать",
+                                "консоль: выключена опция",
+                                "FRAMEBUFFER_CONSOLE_ROTATION.",
+                                "", "Остаётся портретная."], 1)
+                            return None
+                        rot = 1 - get_rotation()
+                        set_rotation(rot)
+                        log(f"rotation -> {rot}")
+                        self.show_result("Ориентация htop и консоли",
+                                         ["Альбомная (120 колонок)" if rot else "Портретная (90/67 колонок)",
+                                          "", "Применится при следующем", "открытии htop или консоли"], 0)
+                        return None
                     if MENU_ITEMS[i][2] is None:
                         return "exit"
                     self.item, self.screen, self.confirm_yes = i, "confirm", False
@@ -736,8 +828,7 @@ class Keys:
             self.wifi.stop()
         self.mode = mode
         if mode == "top":
-            self.top.start()
-            chvt(TOP_VT)
+            self.top.start()             # сам переключает на tty2 и поворачивает консоль
         elif mode == "console":
             self.console.start()
         elif mode == "menu":
@@ -825,6 +916,11 @@ class Keys:
                 self.lock = False
 
     def on_touch(self, x, y, now):
+        if self.mode == "top":
+            # строка F1..F10 — последняя строка htop (с клавиатурой — прямо над ней)
+            self.last_input = now
+            self.top.tap(x, y)
+            return
         if self.mode != "menu" or self.menu.busy():
             return
         self.last_input = now
@@ -927,6 +1023,27 @@ def main():
 
     evfd = os.open(keys_dev, os.O_RDONLY)
     tfd = os.open(touch_dev, os.O_RDONLY) if touch_dev else None
+    if tfd is not None:
+        # Ядро не присылает координату, если она не изменилась. После перезапуска
+        # службы касание в ту же точку пришло бы без X/Y — берём текущие значения.
+        # Для MT-осей значения хранятся по слотам: EVIOCGMTSLOTS, слот 0.
+        nslots = 16
+        size = 4 * (1 + nslots)
+        req = (2 << 30) | (size << 16) | (ord("E") << 8) | 0x0a     # EVIOCGMTSLOTS(size)
+        vals = []
+        for code in (ABS_MT_POSITION_X, ABS_MT_POSITION_Y):
+            try:
+                buf = fcntl.ioctl(tfd, req, struct.pack("I", code) + b"\0" * (size - 4))
+                vals.append(struct.unpack(f"I{nslots}i", buf)[1:])
+            except OSError:
+                vals.append((0,) * nslots)
+        try:   # текущий слот: EVIOCGABS(ABS_MT_SLOT)
+            slot = struct.unpack("6i", fcntl.ioctl(tfd, 0x80184540 + 0x2f, b"\0" * 24))[0]
+        except OSError:
+            slot = 0
+        slot = slot if 0 <= slot < nslots else 0
+        touch.x, touch.y = (v[slot] for v in vals)
+        log(f"touch initial position {touch.x},{touch.y} (slot {slot})")
     while True:
         now = time.monotonic()
         fds = [evfd, sig_r]
