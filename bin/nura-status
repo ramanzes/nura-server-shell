@@ -153,7 +153,8 @@ while :; do
     else
       led ok 0 30 0 5000
     fi
-    line "RAM  $(awk '/MemAvailable/{a=$2}/LowFree/{l=$2}END{printf "%dM free, low %dM", a/1024, l/1024}' /proc/meminfo)"
+    # LowFree есть только у 32-битного ядра с highmem (bacon, Nexus 5)
+    line "RAM  $(awk '/MemAvailable/{a=$2}/LowFree/{l=$2;h=1}END{printf "%dM free", a/1024; if (h) printf ", low %dM", l/1024}' /proc/meminfo)"
     line ""
     bl=$(ls -d /sys/class/backlight/* 2>/dev/null | head -1)
     br=$(cat $bl/brightness 2>/dev/null); bmax=$(cat $bl/max_brightness 2>/dev/null)

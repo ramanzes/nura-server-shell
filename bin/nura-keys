@@ -49,6 +49,7 @@ KEY_VOLUMEDOWN, KEY_VOLUMEUP, BTN_TOUCH = 114, 115, 330
 UP, DOWN = KEY_VOLUMEUP, KEY_VOLUMEDOWN
 EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
 ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x35, 0x36
+ABS_MT_SLOT, ABS_MT_TRACKING_ID = 0x2f, 0x39
 EV_FMT = "llHHi"
 EV_SIZE = struct.calcsize(EV_FMT)
 
@@ -427,10 +428,16 @@ class Console:
     def start(self):
         run("pkill", "-x", "buffyboard")     # две копии сразу шлют лишние нажатия
         run("setfont", "-C", self.tty_path, FONT)
-        self.getty_start()
         chvt(CONSOLE_VT)
         self.rot = get_rotation()
-        fbcon_rotate(self.rot)
+        fbcon_rotate(self.rot)           # до getty: иначе приглашение печатается дважды
+        try:                             # busybox getty не очищает экран (agetty очищает)
+            fd = os.open(self.tty_path, os.O_WRONLY | os.O_NOCTTY)
+            os.write(fd, b"\x1b[H\x1b[2J\x1b[3J")
+            os.close(fd)
+        except OSError:
+            pass
+        self.getty_start()
         # buffyboard уменьшает высоту только «занятого» терминала (ignore_unused_terminals),
         # и getty при старте очищает экран — поэтому сначала даём getty открыть tty3
         time.sleep(1.5)
@@ -842,31 +849,55 @@ class Menu:
 
 
 class Touch:
-    """Касания тачскрина (MT protocol B): (x, y) начала касания — при отпускании пальца."""
+    """Касания тачскрина (MT protocol B): (x, y) начала касания — при отпускании пальца.
+
+    Координаты хранятся по слотам: ядро не присылает X/Y, если в этом слоте они не
+    изменились, а разные касания приходят в разные слоты (Novatek на sdm660 —
+    часто в слот 1). Касанием считается первый палец (основной слот).
+    """
 
     def __init__(self):
-        self.x = self.y = 0
-        self.down = False
+        self.slot = 0
+        self.pos = {}            # слот -> [x, y]
+        self.primary = None      # слот первого пальца
         self.start = None
+        self.need_start = False
         self.lifted = False
+        self.down = False        # для устройств без ABS_MT_TRACKING_ID
+        self.mt_ids = False
+
+    def xy(self, slot):
+        return self.pos.setdefault(slot, [0, 0])
 
     def event(self, etype, code, value):
         if etype == EV_ABS:
-            if code == ABS_MT_POSITION_X:
-                self.x = value
+            if code == ABS_MT_SLOT:
+                self.slot = value
+            elif code == ABS_MT_POSITION_X:
+                self.xy(self.slot)[0] = value
             elif code == ABS_MT_POSITION_Y:
-                self.y = value
-        elif etype == EV_KEY and code == BTN_TOUCH:
-            self.down = bool(value)
-            if not value:
+                self.xy(self.slot)[1] = value
+            elif code == ABS_MT_TRACKING_ID:
+                self.mt_ids = True
+                if value >= 0 and self.primary is None:
+                    self.primary, self.need_start = self.slot, True
+                elif value < 0 and self.slot == self.primary:
+                    self.lifted = True
+        elif etype == EV_KEY and code == BTN_TOUCH and not self.mt_ids:
+            if value and not self.down:
+                self.primary, self.need_start = self.slot, True
+            elif not value and self.down:
                 self.lifted = True
+            self.down = bool(value)
         elif etype == EV_SYN and code == 0:
-            if self.down and self.start is None:
-                self.start = (self.x, self.y)
+            if self.need_start and self.primary is not None:
+                self.need_start = False
+                self.start = tuple(self.xy(self.primary))
             if self.lifted:
                 self.lifted = False
-                start, self.start = self.start, None
-                if start and abs(self.x - start[0]) + abs(self.y - start[1]) <= TAP_MAX_MOVE:
+                end = tuple(self.xy(self.primary)) if self.primary is not None else None
+                start, self.start, self.primary = self.start, None, None
+                if start and end and abs(end[0] - start[0]) + abs(end[1] - start[1]) <= TAP_MAX_MOVE:
                     return start
         return None
 
@@ -1099,7 +1130,7 @@ def main():
     if tfd is not None:
         # Ядро не присылает координату, если она не изменилась. После перезапуска
         # службы касание в ту же точку пришло бы без X/Y — берём текущие значения.
-        # Для MT-осей значения хранятся по слотам: EVIOCGMTSLOTS, слот 0.
+        # Для MT-осей значения хранятся по слотам: EVIOCGMTSLOTS — все слоты.
         nslots = 16
         size = 4 * (1 + nslots)
         req = (2 << 30) | (size << 16) | (ord("E") << 8) | 0x0a     # EVIOCGMTSLOTS(size)
@@ -1115,8 +1146,10 @@ def main():
         except OSError:
             slot = 0
         slot = slot if 0 <= slot < nslots else 0
-        touch.x, touch.y = (v[slot] for v in vals)
-        log(f"touch initial position {touch.x},{touch.y} (slot {slot})")
+        touch.slot = slot
+        for n in range(nslots):
+            touch.pos[n] = [vals[0][n], vals[1][n]]
+        log(f"touch: current slot {slot}, slot positions taken from kernel")
     while True:
         now = time.monotonic()
         fds = evfds + [sig_r]
