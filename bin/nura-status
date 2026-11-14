@@ -39,6 +39,16 @@ led() {   # led <state> <R> <G> <B> <период мс>   (R G B в шкале 0
     echo "$m 120 $m 0 0 $(( $5 - 120 )) 0 0" > $LEDS/rgb:status/pattern
     return
   fi
+  if [ -e $LEDS/white:status ]; then
+    # один белый светодиод (Redmi Note 7): цвета нет — состояние видно по частоте
+    # вспышек (раз в 5 с / 2 с / 1 с), яркость — по самому яркому каналу
+    w=$2; [ "$3" -gt "$w" ] && w=$3; [ "$4" -gt "$w" ] && w=$4
+    m=$(cat $LEDS/white:status/max_brightness)
+    v=$(( w * m / 255 ))
+    grep -q '\[pattern\]' $LEDS/white:status/trigger || echo pattern > $LEDS/white:status/trigger
+    echo "$v 120 $v 0 0 $(( $5 - 120 )) 0 0" > $LEDS/white:status/pattern
+    return
+  fi
   # bacon: три отдельных канала. Только триггер pattern: udev-правило feedbackd
   # (72-feedbackd.rules) всё равно возвращает его при любом изменении.
   # Выключенный канал = шаблон из нулей.
@@ -53,7 +63,7 @@ led() {   # led <state> <R> <G> <B> <период мс>   (R G B в шкале 0
 # Чип светодиода иногда не отвечает при загрузке (-ENXIO), и драйвер не подключается.
 # Пробуем подключить заново; после успеха LED_LAST сброшен, и шаблон запишется снова.
 led_heal() {
-  [ -e $LEDS/red:status ] || [ -e $LEDS/rgb:status ] && return
+  [ -e $LEDS/red:status ] || [ -e $LEDS/rgb:status ] || [ -e $LEDS/white:status ] && return
   [ -d /sys/bus/i2c/drivers/leds-is31fl319x ] || return     # только bacon
   LED_LAST=""
   echo 1-0068 > /sys/bus/i2c/drivers/leds-is31fl319x/bind 2>/dev/null
@@ -106,7 +116,14 @@ while :; do
     # первый power_supply с type=Battery (bacon: bq27541-0, Nexus 5: battery)
     b=$(for p in /sys/class/power_supply/*; do [ "$(cat $p/type 2>/dev/null)" = Battery ] && { echo $p; break; }; done)
     cap=$(cat $b/capacity 2>/dev/null); st=$(cat $b/status 2>/dev/null)
-    chg=$(cat /sys/class/power_supply/bq24190-charger/online 2>/dev/null)
+    # зарядка: любой источник питания USB/Mains/Wireless с online=1
+    # (bacon, Nexus 5: bq24190-charger; Redmi Note 7: pm660-charger)
+    chg=0
+    for p in /sys/class/power_supply/*; do
+      case $(cat $p/type 2>/dev/null) in USB*|Mains|Wireless)
+        [ "$(cat $p/online 2>/dev/null)" = 1 ] && chg=1;;
+      esac
+    done
     # у Nexus 5 status иногда возвращает число вместо слова — берём по зарядному
     case "$st" in [A-Z]*) ;; *) [ "$chg" = 1 ] && st=Charging || st=Discharging;; esac
     [ "${cap:-0}" -lt 20 ] && c=$R || c=$G
@@ -138,8 +155,9 @@ while :; do
     fi
     line "RAM  $(awk '/MemAvailable/{a=$2}/LowFree/{l=$2}END{printf "%dM free, low %dM", a/1024, l/1024}' /proc/meminfo)"
     line ""
-    br=$(cat /sys/class/backlight/lcd-backlight/brightness 2>/dev/null)
-    line "Lght $((br*100/255))%"
+    bl=$(ls -d /sys/class/backlight/* 2>/dev/null | head -1)
+    br=$(cat $bl/brightness 2>/dev/null); bmax=$(cat $bl/max_brightness 2>/dev/null)
+    line "Lght $(( ${br:-0} * 100 / ${bmax:-255} ))%"
     line ""
     line "${W}VOL +/-: brightness${N}"
     line "${W}VOL + and -: htop${N}"

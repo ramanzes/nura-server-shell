@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 ramanzes — https://github.com/ramanzes/nura-server-shell
+# nura-ctl — управление экраном оболочки удалённо, как кнопками:
+#   nura-ctl top       = VOL+ и VOL- вместе (табло <-> htop)
+#   nura-ctl console   = VOL- дважды        (консоль)
+#   nura-ctl menu      = VOL+ дважды        (меню)
+case "${1:-}" in
+  top) sig=USR1 ;;
+  console) sig=USR2 ;;
+  menu) sig=HUP ;;
+  *) sed -n '4,7p' "$0"; exit 2 ;;
+esac
+if [ -d /run/systemd/system ]; then
+  exec systemctl kill --kill-whom=main -s "$sig" nura-keys
+fi
+pid=$(pgrep -o -f "python3 -I /usr/local/bin/nura-keys")
+[ -n "$pid" ] || { echo "nura-keys не запущен" >&2; exit 1; }
+exec kill -"$sig" "$pid"

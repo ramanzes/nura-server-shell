@@ -16,9 +16,11 @@
     VOL+ дважды          -> меню действий     (из меню — на табло)
     удержание VOL+/VOL-  непрерывное действие
 
-Удалённо: sudo systemctl kill --kill-whom=main -s USR1 nura-keys   (= VOL+ и VOL-)
-          sudo systemctl kill --kill-whom=main -s USR2 nura-keys   (= VOL- дважды)
-          sudo systemctl kill --kill-whom=main -s HUP  nura-keys   (= VOL+ дважды)
+Удалённо: sudo nura-ctl top | console | menu   (сигналы USR1 / USR2 / HUP процессу nura-keys)
+
+Железо определяется само: экран (fb0), подсветка, кнопки громкости (любые устройства
+с KEY_VOLUMEUP/DOWN — на sdm660 VOL- на pm8941_resin), тачскрин (устройство с
+ABS_MT_POSITION_X). Система инициализации — systemd или OpenRC.
 
 htop, консоль и меню работают только в своём режиме. Выход из консоли
 завершает сессию входа. Меню закрывается через IDLE_MENU секунд без
@@ -40,8 +42,9 @@ import termios
 import time
 import tty
 
-BL = "/sys/class/backlight/lcd-backlight"
-LEVELS = [2, 4, 8, 14, 22, 34, 50, 70, 95, 125, 160, 205, 255]
+BL = (sorted(glob.glob("/sys/class/backlight/*")) or ["/sys/class/backlight/lcd-backlight"])[0]
+LEVELS_PCT = [1, 2, 3, 5, 8, 12, 18, 26, 36, 48, 62, 80, 100]   # глаз — логарифмический
+SYSTEMD = os.path.isdir("/run/systemd/system")
 KEY_VOLUMEDOWN, KEY_VOLUMEUP, BTN_TOUCH = 114, 115, 330
 UP, DOWN = KEY_VOLUMEUP, KEY_VOLUMEDOWN
 EV_SYN, EV_KEY, EV_ABS = 0, 1, 3
@@ -69,7 +72,17 @@ WIFI_LOG = "/run/nura-wifi-join.log"
 WIFI_MAX = 6           # сколько сетей показывать (по силе сигнала)
 FONT = "ter-v32b"      # 16x32 -> 67x60; с удвоением (-d) 32x64 -> 33x30
 TOP_FONT_PORTRAIT = "ter-v24b"   # 12x24 -> 90x80: строка F1..F10 htop (81 колонка) помещается
-SCREEN_W, SCREEN_H = 1080, 1920  # кадровый буфер в портретной ориентации
+def _screen_size():
+    """Видимый размер экрана: /sys/class/graphics/fb0/modes («U:1080x2340p-0»)."""
+    try:
+        with open("/sys/class/graphics/fb0/modes") as f:
+            w, h = f.readline().split(":")[1].split("p")[0].split("x")
+            return int(w), int(h)
+    except (OSError, ValueError, IndexError):
+        return 1080, 1920
+
+
+SCREEN_W, SCREEN_H = _screen_size()  # портрет: 1080x1920 (msm8974), 1080x2340 (sdm660)
 ROT_FILE = "/var/lib/nura-server-shell/rotate"   # 0 — портрет, 1 — альбом (htop и консоль)
 # F1..F10 для TERM=linux (htop запущен с ним)
 FKEYS = [b"\x1b[[A", b"\x1b[[B", b"\x1b[[C", b"\x1b[[D", b"\x1b[[E",
@@ -113,8 +126,8 @@ MENU_ITEMS = [
     ("Ориентация htop/консоли", ROT_ITEM, None),
     ("Перезапустить контейнеры", "Перезапустить контейнеры?", CMD_CONTAINERS),
     ("Переподключить Wi-Fi", "Переподключить Wi-Fi?", CMD_WIFI),
-    ("Перезагрузить", "Перезагрузить телефон?", "echo 'Перезагрузка...'; systemctl reboot"),
-    ("Выключить", "Выключить телефон?", "echo 'Выключение...'; systemctl poweroff"),
+    ("Перезагрузить", "Перезагрузить телефон?", "echo 'Перезагрузка...'; reboot"),
+    ("Выключить", "Выключить телефон?", "echo 'Выключение...'; poweroff"),
     ("Назад", None, None),
 ]
 
@@ -125,6 +138,39 @@ def log(msg):
 
 def run(*cmd):
     subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _caps(event, kind):
+    """Битовая маска возможностей устройства (capabilities/key, abs) как int."""
+    try:
+        with open(f"/sys/class/input/{event}/device/capabilities/{kind}") as f:
+            words = f.read().split()
+    except OSError:
+        return 0
+    mask = 0
+    for w in words:                       # старшие слова — первыми, по 64 бита
+        mask = (mask << 64) | int(w, 16)
+    return mask
+
+
+def key_devices():
+    """Все устройства с кнопками громкости (на sdm660 VOL+ и VOL- — на разных)."""
+    devs = []
+    for path in sorted(glob.glob("/sys/class/input/event*")):
+        ev = os.path.basename(path)
+        keys = _caps(ev, "key")
+        if keys >> KEY_VOLUMEUP & 1 or keys >> KEY_VOLUMEDOWN & 1:
+            devs.append("/dev/input/" + ev)
+    return devs
+
+
+def touch_device():
+    """Первое устройство с мультитач-координатами (Synaptics, Novatek, ...)."""
+    for path in sorted(glob.glob("/sys/class/input/event*")):
+        ev = os.path.basename(path)
+        if _caps(ev, "abs") >> ABS_MT_POSITION_X & 1:
+            return "/dev/input/" + ev
+    return None
 
 
 def find_device(name, prefix=False):
@@ -144,11 +190,12 @@ def read_int(path):
 
 def bright_step(direction):
     cur = read_int(BL + "/brightness")
+    top = read_int(BL + "/max_brightness")         # 255 (msm8974), 4095 (sdm660)
+    levels = sorted({max(1, round(p * top / 100)) for p in LEVELS_PCT})
     if direction > 0:
-        new = next((v for v in LEVELS if v > cur), LEVELS[-1])
+        new = next((v for v in levels if v > cur), levels[-1])
     else:
-        new = next((v for v in reversed(LEVELS) if v < cur), LEVELS[0])
-    new = min(new, read_int(BL + "/max_brightness"))
+        new = next((v for v in reversed(levels) if v < cur), levels[0])
     with open(BL + "/brightness", "w") as f:
         f.write(str(new))
 
@@ -354,12 +401,33 @@ class Console:
 
     def __init__(self):
         self.kbd = None
+        self.getty_proc = None   # OpenRC: getty запускаем сами (в inittab tty3 отключён)
         self.started = 0.0
+
+    def getty_start(self):
+        if SYSTEMD:
+            run("systemctl", "start", self.getty)
+        else:
+            self.getty_proc = subprocess.Popen(
+                ["setsid", "getty", "38400", f"tty{CONSOLE_VT}"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def getty_stop(self):
+        if SYSTEMD:
+            run("systemctl", "stop", self.getty)
+        else:
+            run("pkill", "-f", f"getty 38400 tty{CONSOLE_VT}$")
+            if self.getty_proc:
+                try:
+                    self.getty_proc.wait(2)
+                except subprocess.TimeoutExpired:
+                    pass
+                self.getty_proc = None
 
     def start(self):
         run("pkill", "-x", "buffyboard")     # две копии сразу шлют лишние нажатия
         run("setfont", "-C", self.tty_path, FONT)
-        run("systemctl", "start", self.getty)
+        self.getty_start()
         chvt(CONSOLE_VT)
         self.rot = get_rotation()
         fbcon_rotate(self.rot)
@@ -392,7 +460,7 @@ class Console:
         for sid in self.sessions():
             run("loginctl", "terminate-session", sid)
             log(f"session {sid} on tty{CONSOLE_VT} terminated")
-        run("systemctl", "stop", self.getty)
+        self.getty_stop()
         log("console stopped")
 
     def last_activity(self):
@@ -530,7 +598,7 @@ class Menu:
     """Меню действий на tty4: выбор кнопками громкости, выполнение касанием."""
     tty_path = f"/dev/tty{MENU_VT}"
     COLS, ROWS = 33, 30
-    ROW_PX = 1920 // 30          # высота строки в пикселях (шрифт 32x64)
+    ROW_PX = SCREEN_H // 30      # уточняется в start() по реальному числу строк
     ITEM_TOP, ITEM_H, ITEM_GAP = 2, 2, 1       # 6 пунктов + запас, кнопка 128 px
     YES_ROWS, NO_ROWS = range(8, 14), range(16, 22)
 
@@ -551,6 +619,11 @@ class Menu:
     def start(self):
         run("setfont", "-C", self.tty_path, "-d", FONT)
         self.out = os.open(self.tty_path, os.O_WRONLY | os.O_NOCTTY)
+        try:   # 30 строк на 1920 px, 36 — на 2340 px
+            rows, cols = struct.unpack("HHHH", fcntl.ioctl(self.out, termios.TIOCGWINSZ, b"\0" * 8))[:2]
+            self.ROWS, self.COLS, self.ROW_PX = rows, cols, SCREEN_H // max(rows, 1)
+        except OSError:
+            pass
         self.screen, self.sel = "list", 0
         chvt(MENU_VT)
         self.draw()
@@ -999,13 +1072,13 @@ def read_events(fd):
 
 
 def main():
-    keys_dev = None
-    while keys_dev is None:
-        keys_dev = find_device("gpio-keys")
-        if keys_dev is None:
-            time.sleep(2)
-    touch_dev = find_device("Synaptics", prefix=True)   # bacon: s3508, Nexus 5: PLG218
-    log(f"input: keys {keys_dev}, touch {touch_dev}")
+    keys_devs = key_devices()
+    while not keys_devs:
+        time.sleep(2)
+        keys_devs = key_devices()
+    touch_dev = touch_device()
+    log(f"input: keys {' '.join(keys_devs)}, touch {touch_dev}; screen {SCREEN_W}x{SCREEN_H}; "
+        f"backlight {BL}; init {'systemd' if SYSTEMD else 'openrc'}")
     k = Keys()
     touch = Touch()
 
@@ -1019,9 +1092,9 @@ def main():
     signal.set_wakeup_fd(sig_w)
     for s in (signal.SIGUSR1, signal.SIGUSR2, signal.SIGHUP):
         signal.signal(s, lambda *a: None)
-    run("systemctl", "stop", Console.getty)  # на случай перезапуска из режима консоли
+    Console().getty_stop()                    # на случай перезапуска из режима консоли
 
-    evfd = os.open(keys_dev, os.O_RDONLY)
+    evfds = [os.open(d, os.O_RDONLY) for d in keys_devs]
     tfd = os.open(touch_dev, os.O_RDONLY) if touch_dev else None
     if tfd is not None:
         # Ядро не присылает координату, если она не изменилась. После перезапуска
@@ -1046,7 +1119,7 @@ def main():
         log(f"touch initial position {touch.x},{touch.y} (slot {slot})")
     while True:
         now = time.monotonic()
-        fds = [evfd, sig_r]
+        fds = evfds + [sig_r]
         if tfd is not None:
             fds.append(tfd)
         if k.top.running():
@@ -1065,7 +1138,9 @@ def main():
                     k.double(DOWN)
                 elif s == signal.SIGHUP:
                     k.double(UP)
-        if evfd in r:
+        for evfd in evfds:
+            if evfd not in r:
+                continue
             for etype, code, value in read_events(evfd):
                 if etype == EV_KEY:
                     k.on_key(code, value, now)

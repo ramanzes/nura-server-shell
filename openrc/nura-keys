@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-3.0-or-later
+description="nura-server-shell: кнопки, тачскрин, htop, консоль, меню"
+command=/usr/local/bin/nura-keys
+supervisor=supervise-daemon
+respawn_delay=3
+respawn_max=0
+output_log=/var/log/nura-keys.log
+error_log=/var/log/nura-keys.log
+
+depend() {
+	need localmount
+	after nura-status
+}

@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-3.0-or-later
+description="nura-server-shell: табло состояния на tty1"
+command=/usr/local/bin/nura-status
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need localmount
+	after networkmanager docker
+}
