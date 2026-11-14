@@ -130,6 +130,13 @@ else
 fi
 echo 'kernel.printk = 3 4 1 3' > /etc/sysctl.d/50-console-quiet.conf
 sysctl -q -p /etc/sysctl.d/50-console-quiet.conf || true
+# SysRq с клавиатуры (в т. ч. USB через OTG) обходит блокировку экрана — выключить
+echo 'kernel.sysrq = 0' > /etc/sysctl.d/50-nura-sysrq.conf
+sysctl -q -p /etc/sysctl.d/50-nura-sysrq.conf || true
+# настройки (не перезаписываются при обновлении)
+[ -e /etc/nura-server-shell.conf ] || install -m 644 "$SRC/config/nura-server-shell.conf" /etc/nura-server-shell.conf
+grep -q '^LOCK=1' /etc/nura-server-shell.conf && \
+  say "Блокировка экрана паролем включена (/etc/nura-server-shell.conf, LOCK=1)"
 
 # --- графика ---
 if [ -n "$GUI_SVC" ]; then

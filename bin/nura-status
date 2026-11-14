@@ -17,7 +17,8 @@ HOM=$(awk -F: -v u="$USR" '$1==u {print $6}' /etc/passwd)
 
 # Крупный шрифт: 16x32 удвоенный до 32x64 (33x30 символов), при отказе — без удвоения
 setfont -C "$TTY" -d ter-v32b 2>/dev/null || setfont -C "$TTY" ter-v32b 2>/dev/null
-chvt 1
+# при включённой блокировке экрана переключение запрещено и chvt ждал бы вечно
+timeout 2 chvt 1 2>/dev/null || true
 # Скрыть курсор, гасить экран через BLANK_MIN мин (любая кнопка его включает)
 printf '\033[?25l\033[9;%s]\033[2J' "$BLANK_MIN" >"$TTY"
 
@@ -147,12 +148,14 @@ while :; do
       BAD_STREAK=0
     fi
     if [ $BAD_STREAK -ge 2 ]; then
-      led bad 60 0 0 1000
+      led bad 60 0 0 1000; state=bad
     elif [ "${cap:-100}" -lt 20 ] && [ "$st" != Charging ]; then
-      led warn 60 25 0 2000
+      led warn 60 25 0 2000; state=warn
     else
-      led ok 0 30 0 5000
+      led ok 0 30 0 5000; state=ok
     fi
+    # общее состояние для экрана блокировки (без подробностей)
+    echo "$state" > /run/nura-status.state.tmp && mv /run/nura-status.state.tmp /run/nura-status.state
     # LowFree есть только у 32-битного ядра с highmem (bacon, Nexus 5)
     line "RAM  $(awk '/MemAvailable/{a=$2}/LowFree/{l=$2;h=1}END{printf "%dM free", a/1024; if (h) printf ", low %dM", l/1024}' /proc/meminfo)"
     line ""

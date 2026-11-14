@@ -65,6 +65,19 @@ IDLE_TOP = 300         # с: htop без нажатий -> табло
 IDLE_CONSOLE = 600     # с: консоль без ввода -> logout и табло
 IDLE_MENU = 45         # с: меню без действий -> табло (экран гаснет через 60 с)
 IDLE_WIFI = 300        # с: ввод пароля Wi-Fi без действий -> табло
+
+# --- блокировка экрана паролем пользователя ---
+LOCK_VT = 7
+LOCK_FAILS_MAX = 5     # неверных паролей подряд -> пауза
+LOCK_LOCKOUT = 300     # с: пауза после LOCK_FAILS_MAX ошибок
+LOCK_DELAY = 2.0       # с: задержка после каждой ошибки
+CONF_FILE = "/etc/nura-server-shell.conf"
+STATE_FILE = "/run/nura-status.state"          # ok | warn | bad — пишет nura-status
+FAILS_FILE = "/var/lib/nura-server-shell/lock-fails"
+FB_BLANK = "/sys/class/graphics/fb0/blank"
+KEY_POWER = 116
+VT_LOCKSWITCH, VT_UNLOCKSWITCH = 0x560B, 0x560C
+TIOCLINUX, TIOCL_BLANKSCREEN = 0x541C, 14
 TAP_MAX_MOVE = 120     # px: больше — это свайп, а не касание
 
 STATUS_VT, TOP_VT, CONSOLE_VT, MENU_VT, WIFI_VT = 1, 2, 3, 4, 5
@@ -168,6 +181,16 @@ def key_devices():
     return devs
 
 
+def power_devices():
+    """Устройства с кнопкой питания (KEY_POWER): короткое нажатие — блокировка."""
+    devs = []
+    for path in sorted(glob.glob("/sys/class/input/event*")):
+        ev = os.path.basename(path)
+        if _caps(ev, "key") >> KEY_POWER & 1:
+            devs.append("/dev/input/" + ev)
+    return devs
+
+
 def touch_device():
     """Первое устройство с мультитач-координатами (Synaptics, Novatek, ...)."""
     for path in sorted(glob.glob("/sys/class/input/event*")):
@@ -205,7 +228,265 @@ def bright_step(direction):
 
 
 def chvt(n):
-    run("chvt", str(n))
+    # Ограничение времени: при запрете переключения (VT_LOCKSWITCH) chvt ждёт вечно.
+    try:
+        subprocess.run(["chvt", str(n)], check=False, timeout=3,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        log(f"chvt {n}: timeout (switching locked?)")
+
+
+def read_conf():
+    """/etc/nura-server-shell.conf: KEY=VALUE (LOCK=0 — без блокировки, LOCK_USER=...)."""
+    conf = {"LOCK": "1", "LOCK_USER": ""}
+    try:
+        with open(CONF_FILE) as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and "=" in ln:
+                    key, val = ln.split("=", 1)
+                    conf[key.strip()] = val.strip().strip('"')
+    except OSError:
+        pass
+    return conf
+
+
+def main_user():
+    """Основной пользователь: первый с UID 10000..59999 (как в postmarketOS)."""
+    try:
+        with open("/etc/passwd") as f:
+            for ln in f:
+                p = ln.split(":")
+                if len(p) > 2 and p[2].isdigit() and 10000 <= int(p[2]) < 60000:
+                    return p[0]
+    except OSError:
+        pass
+    return "root"
+
+
+def check_password(user, password):
+    """Проверка системного пароля через unix_chkpwd (Linux-PAM), как у блокировщиков экрана."""
+    for helper in ("/usr/sbin/unix_chkpwd", "/sbin/unix_chkpwd"):
+        if os.path.exists(helper):
+            break
+    else:
+        log("lock: unix_chkpwd not found")
+        return False
+    try:
+        r = subprocess.run([helper, user, "nonull"], input=password + b"\0",
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        return r.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def vt_lockswitch(on):
+    """Запрет переключения консолей (Alt+Fn, chvt) — на время блокировки."""
+    try:
+        fd = os.open("/dev/tty0", os.O_RDWR | os.O_NOCTTY)
+        try:
+            fcntl.ioctl(fd, VT_LOCKSWITCH if on else VT_UNLOCKSWITCH)
+        finally:
+            os.close(fd)
+    except OSError as e:
+        log(f"lock: VT_{'LOCK' if on else 'UNLOCK'}SWITCH failed: {e}")
+
+
+def screen_blank():
+    try:
+        fd = os.open("/dev/tty0", os.O_RDWR | os.O_NOCTTY)
+        try:
+            fcntl.ioctl(fd, TIOCLINUX, bytes([TIOCL_BLANKSCREEN]))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def screen_blanked():
+    try:
+        with open(FB_BLANK) as f:
+            return f.read().strip() not in ("", "0")
+    except OSError:
+        return False
+
+
+class Lock:
+    """Экран блокировки на tty7: пароль пользователя с экранной клавиатуры.
+
+    Ввод читается прямо с tty7 (raw), пароль проверяет unix_chkpwd. Пока экран
+    заблокирован, переключение консолей запрещено (VT_LOCKSWITCH).
+    """
+    tty_path = f"/dev/tty{LOCK_VT}"
+    STATES = {"ok": ("в порядке", "1;32"), "warn": ("предупреждение", "1;33"),
+              "bad": ("проблема", "1;31")}
+
+    def __init__(self, user):
+        self.user = user
+        self.out = None
+        self.kbd = None
+        self.buf = bytearray()
+        self.msg = ""
+        self.esc = 0
+        self.drawn = 0.0
+
+    def start(self):
+        run("setfont", "-C", self.tty_path, "-d", FONT)
+        self.out = os.open(self.tty_path, os.O_RDWR | os.O_NOCTTY)
+        tty.setraw(self.out)
+        termios.tcflush(self.out, termios.TCIFLUSH)
+        self.buf.clear()
+        self.msg, self.esc = "", 0
+        vt_lockswitch(False)             # снять запрет от аварийно завершённого процесса
+        chvt(LOCK_VT)
+        vt_lockswitch(True)
+        run("pkill", "-x", "buffyboard")
+        os.write(self.out, b"\x1b[0m\x1b[2J")   # полная очистка — только до запуска клавиатуры
+        self.draw()
+        # как в консоли: buffyboard уменьшает высоту только «занятого» и уже активного
+        # терминала — даём переключению завершиться, иначе tty7 остаётся во весь экран
+        # и перерисовка текста затирает клавиатуру
+        time.sleep(1.0)
+        self.kbd = subprocess.Popen(buffyboard_cmd(0), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("locked")
+
+    def stop(self):
+        vt_lockswitch(False)
+        if self.kbd:
+            self.kbd.terminate()
+            try:
+                self.kbd.wait(2)
+            except subprocess.TimeoutExpired:
+                self.kbd.kill()
+                self.kbd.wait()
+            self.kbd = None
+        if self.out is not None:
+            os.write(self.out, b"\x1b[0m\x1b[2J\x1b[H")
+            os.close(self.out)
+            self.out = None
+        self.buf = bytearray()
+
+    def keyboard_alive(self):
+        return self.kbd is not None and self.kbd.poll() is None
+
+    def restart_keyboard(self):
+        self.kbd = subprocess.Popen(buffyboard_cmd(0), stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # --- счётчик ошибок (на диске: перезапуск службы его не сбрасывает) ---
+    @staticmethod
+    def fails():
+        try:
+            with open(FAILS_FILE) as f:
+                n, t = f.read().split()
+                return int(n), float(t)
+        except (OSError, ValueError):
+            return 0, 0.0
+
+    @staticmethod
+    def save_fails(n):
+        os.makedirs(os.path.dirname(FAILS_FILE), exist_ok=True)
+        with open(FAILS_FILE, "w") as f:
+            f.write(f"{n} {time.time()}\n")
+
+    def lockout_left(self):
+        n, t = self.fails()
+        if n >= LOCK_FAILS_MAX:
+            left = LOCK_LOCKOUT - (time.time() - t)
+            if left > 0:
+                return int(left) + 1
+        return 0
+
+    # --- экран ---
+    def w(self, s):
+        os.write(self.out, s.encode())
+
+    def at(self, row, text, style="0"):
+        self.w(f"\x1b[{row + 1};1H\x1b[{style}m{text[:33]}\x1b[K\x1b[0m")
+
+    def draw(self):
+        if self.out is None:
+            return
+        try:
+            with open(STATE_FILE) as f:
+                state = f.read().strip()
+        except OSError:
+            state = ""
+        label, style = self.STATES.get(state, ("—", "37"))
+        # без ESC[2J: стираем только строки текста, область клавиатуры не трогаем
+        self.w("\x1b[?25l\x1b[0m")
+        for row in (2, 5, 7, 10):
+            self.at(row, "")
+        self.at(0, " " + os.uname().nodename, "1;33")
+        self.at(1, " " + time.strftime("%d.%m %H:%M"), "37")
+        self.at(3, " Состояние:", "37")
+        self.at(4, " " + label, style)
+        self.at(6, " ЗАБЛОКИРОВАНО", "1;37")
+        left = self.lockout_left()
+        if left:
+            self.at(8, f" Много ошибок. Ждите {left} с", "1;31")
+            self.at(9, "")
+        else:
+            self.at(8, " Пароль и Enter:", "37")
+            self.prompt()
+        self.at(11, (" " + self.msg) if self.msg else "", "1;31")
+        self.drawn = time.monotonic()
+
+    def prompt(self):
+        self.at(9, " " + "*" * min(len(self.buf), 30) + "_", "1;37")
+
+    # --- ввод ---
+    def feed(self, data):
+        """Байты с клавиатуры. True — пароль верный, можно разблокировать."""
+        if self.lockout_left():
+            self.buf.clear()
+            self.draw()
+            return False
+        for b in data:
+            if self.esc:                 # пропуск ESC-последовательностей (стрелки и т. п.)
+                if self.esc == 1:
+                    self.esc = 2 if b in (0x5b, 0x4f) else 0
+                elif 0x40 <= b <= 0x7e:
+                    self.esc = 0
+                continue
+            if b == 0x1b:
+                self.esc = 1
+            elif b in (0x0d, 0x0a):
+                return self.submit()
+            elif b in (0x7f, 0x08):
+                if self.buf:
+                    self.buf.pop()
+            elif b == 0x15:              # Ctrl+U — стереть всё
+                self.buf.clear()
+            elif b >= 0x20 and len(self.buf) < 256:
+                self.buf.append(b)
+        self.prompt()
+        return False
+
+    def submit(self):
+        password = bytes(self.buf)
+        self.buf.clear()
+        if not password:
+            self.prompt()
+            return False
+        self.at(9, " Проверка...", "37")
+        if check_password(self.user, password):
+            self.save_fails(0)
+            log(f"unlocked by password of {self.user}")
+            return True
+        n = self.fails()[0] + 1
+        self.save_fails(n)
+        log(f"lock: wrong password ({n} in a row)")
+        self.msg = "Неверный пароль"
+        time.sleep(LOCK_DELAY)
+        termios.tcflush(self.out, termios.TCIFLUSH)   # набранное во время паузы — в сторону
+        self.draw()
+        return False
+
+    def tick(self):
+        if self.out is not None and time.monotonic() - self.drawn >= 30 and not self.buf:
+            self.draw()                  # часы и оставшаяся пауза
 
 
 def get_rotation():
@@ -912,6 +1193,10 @@ class Keys:
         self.console = Console()
         self.menu = Menu()
         self.wifi = WifiJoin()
+        conf = read_conf()
+        self.lock_enabled = conf.get("LOCK", "1") != "0"
+        self.locker = Lock(conf.get("LOCK_USER") or main_user())
+        self.blank_at = None
         self.down = set()
         self.pending = None      # (key, t) — нажата, ещё не ясно: щелчок/удержание/комбо
         self.tap_wait = None     # (key, t отпускания) — ждём второй щелчок
@@ -933,6 +1218,8 @@ class Keys:
             self.menu.stop()
         elif old == "wifi":
             self.wifi.stop()
+        elif old == "lock":
+            self.locker.stop()
         self.mode = mode
         if mode == "top":
             self.top.start()             # сам переключает на tty2 и поворачивает консоль
@@ -942,12 +1229,27 @@ class Keys:
             self.menu.start()
         elif mode == "wifi":
             self.wifi.start()
+        elif mode == "lock":
+            self.locker.start()
         else:
             chvt(STATUS_VT)
         log(f"mode {old} -> {mode}")
 
+    def do_lock(self, blank=False):
+        if not self.lock_enabled or self.mode == "lock":
+            return
+        if self.mode == "menu" and self.menu.busy():
+            return                       # дождаться окончания действия меню
+        self.pending = self.held = self.tap_wait = None
+        self.set_mode("lock")
+        if blank:
+            # buffyboard при запуске включает экран — гасим после её старта
+            self.blank_at = time.monotonic() + 1.5
+
     def has_double(self, key):
         """Есть ли у кнопки в текущем режиме значение «двойное нажатие»."""
+        if self.mode == "lock":
+            return False                 # в блокировке — только яркость
         if self.mode in ("menu", "wifi"):
             return key == UP
         if self.mode == "console":
@@ -955,11 +1257,13 @@ class Keys:
         return True
 
     def combo(self):
-        if self.mode == "menu" and self.menu.busy():
+        if self.mode == "lock" or (self.mode == "menu" and self.menu.busy()):
             return
         self.set_mode("top" if self.mode == "status" else "status")
 
     def double(self, key):
+        if self.mode == "lock":
+            return
         if self.mode == "menu" and self.menu.busy():
             return                   # не уходить, пока выполняется действие
         if key == UP:
@@ -989,6 +1293,10 @@ class Keys:
 
     # --- события кнопок ---
     def on_key(self, code, value, now):
+        if code == KEY_POWER:
+            if value == 1:               # коротко: погасить экран и заблокировать
+                self.do_lock(blank=True)
+            return
         if code not in (UP, DOWN):
             return
         self.last_input = now
@@ -1023,6 +1331,8 @@ class Keys:
                 self.lock = False
 
     def on_touch(self, x, y, now):
+        if self.mode == "lock":
+            return                       # касания — только экранной клавиатуре
         if self.mode == "top":
             # строка F1..F10 — последняя строка htop (с клавиатурой — прямо над ней)
             self.last_input = now
@@ -1061,6 +1371,19 @@ class Keys:
         if self.held and self.held in self.down and not self.lock and now >= self.next_repeat:
             self.action(self.held)
             self.next_repeat = now + self.repeat_interval()
+        if self.blank_at is not None and now >= self.blank_at:
+            self.blank_at = None
+            screen_blank()
+        if self.mode == "lock":
+            self.locker.tick()
+            if not self.locker.keyboard_alive():
+                self.locker.restart_keyboard()
+            return
+        if self.lock_enabled and screen_blanked():
+            log("screen blanked -> lock")
+            self.do_lock()
+            if self.mode == "lock":
+                return
         if self.mode == "top" and now - self.last_input >= IDLE_TOP:
             log("htop idle -> status")
             self.set_mode("status")
@@ -1096,6 +1419,9 @@ class Keys:
             t.append(5.0)            # простой консоли и жив ли buffyboard
         if self.mode in ("menu", "wifi"):
             t.append(1.0)            # простой меню, завершение ввода пароля
+        t.append(2.0)                # гашение экрана -> блокировка; часы на экране блокировки
+        if self.blank_at is not None:
+            t.append(self.blank_at - now)
         return max(0.0, min(t)) if t else None
 
 
@@ -1107,6 +1433,7 @@ def read_events(fd):
 
 def main():
     keys_devs = key_devices()
+    power_devs = [d for d in power_devices() if d not in keys_devs]
     while not keys_devs:
         time.sleep(2)
         keys_devs = key_devices()
@@ -1117,18 +1444,25 @@ def main():
     touch = Touch()
 
     def on_term(*_):
-        k.set_mode("status")
+        if k.mode == "lock":
+            vt_lockswitch(False)         # остаёмся на экране блокировки, табло не показываем
+        else:
+            k.set_mode("status")
         sys.exit(0)
     signal.signal(signal.SIGTERM, on_term)
     sig_r, sig_w = os.pipe()
     os.set_blocking(sig_r, False)
     os.set_blocking(sig_w, False)
     signal.set_wakeup_fd(sig_w)
-    for s in (signal.SIGUSR1, signal.SIGUSR2, signal.SIGHUP):
+    SIG_LOCK, SIG_UNLOCK = signal.SIGRTMIN + 1, signal.SIGRTMIN + 2
+    for s in (signal.SIGUSR1, signal.SIGUSR2, signal.SIGHUP, SIG_LOCK, SIG_UNLOCK):
         signal.signal(s, lambda *a: None)
     Console().getty_stop()                    # на случай перезапуска из режима консоли
+    if k.lock_enabled:
+        log(f"screen lock: on, user {k.locker.user}")
+        k.do_lock()                           # при запуске (загрузке) — сразу блокировка
 
-    evfds = [os.open(d, os.O_RDONLY) for d in keys_devs]
+    evfds = [os.open(d, os.O_RDONLY) for d in keys_devs + power_devs]
     tfd = os.open(touch_dev, os.O_RDONLY) if touch_dev else None
     if tfd is not None:
         # Ядро не присылает координату, если она не изменилась. После перезапуска
@@ -1163,12 +1497,21 @@ def main():
             fds.append(k.top.out)        # ввод с клавиатуры для htop
         if k.menu.fd() is not None:
             fds.append(k.menu.fd())
+        if k.mode == "lock" and k.locker.out is not None:
+            fds.append(k.locker.out)
         r, _, _ = select.select(fds, [], [], k.timeout(now))
         now = time.monotonic()
         if sig_r in r:
             for s in os.read(sig_r, 64):
                 k.last_input = now
-                if s == signal.SIGUSR1:
+                if s == SIG_LOCK:
+                    k.do_lock(blank=True)
+                elif s == SIG_UNLOCK and k.mode == "lock":
+                    log("unlocked remotely (nura-ctl unlock)")
+                    k.set_mode("status")
+                elif k.mode == "lock":
+                    log(f"signal {s} ignored: locked")
+                elif s == signal.SIGUSR1:
                     k.combo()
                 elif s == signal.SIGUSR2:
                     k.double(DOWN)
@@ -1185,6 +1528,13 @@ def main():
                 pos = touch.event(etype, code, value)
                 if pos:
                     k.on_touch(pos[0], pos[1], now)
+        if k.mode == "lock" and k.locker.out is not None and k.locker.out in r:
+            try:
+                data = os.read(k.locker.out, 4096)
+            except OSError:
+                data = b""
+            if data and k.locker.feed(data):
+                k.set_mode("status")
         if k.top.running() and k.top.out in r:
             k.top.forward_input()
             k.last_input = now           # набор на клавиатуре — не простой

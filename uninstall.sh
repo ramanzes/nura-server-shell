@@ -18,12 +18,15 @@ else
   done
 fi
 pkill -x buffyboard 2>/dev/null || true
+# снять запрет переключения консолей, если служба остановлена в режиме блокировки
+python3 -c 'import os, fcntl; fd = os.open("/dev/tty0", os.O_RDWR); fcntl.ioctl(fd, 0x560C); os.close(fd)' 2>/dev/null || true
 rm -f /etc/systemd/system/nura-status.service /etc/systemd/system/nura-keys.service \
       /etc/init.d/nura-status /etc/init.d/nura-keys \
       /usr/local/bin/nura-status /usr/local/bin/nura-keys /usr/local/bin/nura-wifi-join \
       /usr/local/bin/nura-ctl \
       /etc/systemd/logind.conf.d/50-nura-powerkey.conf /etc/elogind/logind.conf.d/50-nura-powerkey.conf \
-      /etc/sysctl.d/50-console-quiet.conf /etc/modules-load.d/ledtrig-pattern.conf \
+      /etc/sysctl.d/50-console-quiet.conf /etc/sysctl.d/50-nura-sysrq.conf \
+      /etc/modules-load.d/ledtrig-pattern.conf /var/lib/nura-server-shell/lock-fails \
       /usr/local/share/nura-server-shell.version /run/nura-wifi-join.log
 
 if [ $INIT = systemd ]; then
