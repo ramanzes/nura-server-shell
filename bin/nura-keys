@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (c) 2026 ramanzes — https://github.com/ramanzes/nura-server-shell
 """nura-keys: кнопки громкости и тачскрин OnePlus One и Nexus 5 (Nura, без Phosh).
 

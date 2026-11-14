@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: GPL-3.0-only
+# SPDX-License-Identifier: GPL-3.0-or-later
 [Unit]
 Description=Volume keys: brightness, htop screen toggle (VOL+ and VOL- together)
 After=systemd-backlight@backlight:lcd-backlight.service nura-status.service
