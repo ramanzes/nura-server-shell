@@ -15,8 +15,17 @@ G='\033[1;32m'; R='\033[1;31m'; Y='\033[1;33m'; D='\033[0;37m'; W='\033[1;37m'; 
 USR=$(awk -F: '$3>=10000 && $3<60000 {print $1; exit}' /etc/passwd)
 HOM=$(awk -F: -v u="$USR" '$1==u {print $6}' /etc/passwd)
 
-# Крупный шрифт: 16x32 удвоенный до 32x64 (33x30 символов), при отказе — без удвоения
-setfont -C "$TTY" -d ter-v32b 2>/dev/null || setfont -C "$TTY" ter-v32b 2>/dev/null
+# Крупный шрифт: 16x32 удвоенный до 32x64 (33x30 символов), при отказе — без удвоения.
+# Проверяется в каждом цикле: при загрузке tty1 может быть ещё в графическом режиме
+# (заставка plymouth), ядро тогда отказывает в смене шрифта, и табло оставалось
+# мелким (8x16, 135 колонок) до перезапуска сервиса.
+big_font() {
+  cols=$(stty -F "$TTY" size 2>/dev/null | cut -d' ' -f2)
+  [ "${cols:-0}" -gt 0 ] && [ "$cols" -le 70 ] && return   # 33 (32x64) или 67 (16x32)
+  setfont -C "$TTY" -d ter-v32b 2>/dev/null || setfont -C "$TTY" ter-v32b 2>/dev/null
+  printf '\033[2J' >"$TTY" 2>/dev/null
+}
+big_font
 # при включённой блокировке экрана переключение запрещено и chvt ждал бы вечно
 timeout 2 chvt 1 2>/dev/null || true
 # Скрыть курсор, гасить экран через BLANK_MIN мин (любая кнопка его включает)
@@ -78,6 +87,7 @@ ok()   { case "${1:-0}" in 3) printf "${G}OK${N}";; 0) printf "${R}FAIL${N}";; *
 BAD_STREAK=0
 
 while :; do
+  big_font
   {
     printf '\033[H'
     up=$(awk '{s=int($1); printf "%dd %dh%02dm", s/86400, s%86400/3600, s%3600/60}' /proc/uptime)
