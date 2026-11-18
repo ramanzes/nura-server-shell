@@ -118,8 +118,13 @@ while :; do
     line "USB  ${usb:--}"
     line ""
 
-    # Docker
-    run=$(docker ps -q --filter status=running 2>/dev/null | wc -l); all=$(docker ps -aq 2>/dev/null | wc -l)
+    # Docker: считаются работающие и те, что должны работать (политика перезапуска
+    # always / unless-stopped / on-failure). Остановленный контейнер без автоперезапуска
+    # (restart=no) выключен намеренно — он не учитывается и не даёт красный светодиод.
+    set -- $(ids=$(docker ps -aq 2>/dev/null)
+      [ -n "$ids" ] && docker inspect -f '{{.State.Running}} {{.HostConfig.RestartPolicy.Name}}' $ids 2>/dev/null |
+        awk '$1 == "true" {r++; a++; next} $2 != "no" && $2 != "" {a++} END {print r+0, a+0}')
+    run=${1:-0}; all=${2:-0}
     if [ "$run" = "$all" ]; then c=$G; else c=$R; fi
     line "Dock ${c}${run}/${all}${N} running"
 
