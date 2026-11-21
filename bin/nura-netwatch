@@ -1,0 +1,48 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (c) 2026 ramanzes — https://github.com/ramanzes/nura-server-shell
+# nura-netwatch: быстрый переход на Wi-Fi, когда проводной путь жив, но шлюз не отвечает.
+#
+# Пример: мост br0 (USB Ethernet + соседний телефон по USB) остаётся «поднятым» после
+# выдёргивания сетевого кабеля — маршрут через него не исчезает, а проверка связи
+# NetworkManager замечает это лишь через ~5 мин. Здесь каждые INTERVAL с шлюз пингуется
+# через проводной интерфейс; после FAILS неудач подряд метрика его маршрута поднимается
+# выше Wi-Fi (nmcli device modify — только в памяти, профиль не меняется), после
+# первого же ответа шлюза — возвращается.
+#
+# Использование: nura-netwatch <интерфейс>   (lavender: br0, Nexus 5: usb0)
+IF=${1:?usage: nura-netwatch <interface>}
+INTERVAL=10
+FAILS=2
+BAD_METRIC=20000
+
+log() { logger -t nura-netwatch "$IF: $*"; }
+
+gateway() { ip -4 route show default dev "$IF" 2>/dev/null | awk '{print $3; exit}'; }
+gw_ok() { ping -I "$IF" -c2 -i0.3 -W2 -q "$1" >/dev/null 2>&1; }
+
+set_metric() {   # set_metric <метрика|-1>   (-1 — по умолчанию профиля)
+  nmcli device modify "$IF" ipv4.route-metric "$1" >/dev/null 2>&1 &&
+    nmcli device modify "$IF" ipv6.route-metric "$1" >/dev/null 2>&1
+}
+
+bad=0; demoted=0; last_gw=""
+log "started"
+while :; do
+  gw=$(gateway); [ -n "$gw" ] && last_gw=$gw
+  if [ -z "$last_gw" ]; then
+    sleep "$INTERVAL"; continue          # интерфейс ещё без адреса — следить нечего
+  fi
+  if gw_ok "$last_gw"; then
+    bad=0
+    if [ $demoted = 1 ]; then
+      set_metric -1 && { demoted=0; log "gateway $last_gw back, wired route restored"; }
+    fi
+  else
+    bad=$((bad + 1))
+    if [ $demoted = 0 ] && [ $bad -ge $FAILS ]; then
+      set_metric $BAD_METRIC && { demoted=1; log "gateway $last_gw unreachable, traffic -> Wi-Fi"; }
+    fi
+  fi
+  sleep "$INTERVAL"
+done

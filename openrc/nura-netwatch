@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+# SPDX-License-Identifier: GPL-3.0-or-later
+description="nura-server-shell: переход на Wi-Fi, если шлюз за проводом не отвечает"
+# интерфейс — в /etc/conf.d/nura-netwatch: NETWATCH_IF=br0
+command=/usr/local/bin/nura-netwatch
+command_args="${NETWATCH_IF:-usb0}"
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need networkmanager
+}
